@@ -1,0 +1,29 @@
+# Maven
+target/
+dependency-reduced-pom.xml
+*.class
+
+# Output files
+output/
+*.log
+*.log.lck
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+
+# Documentation (optional - uncomment if you don't want to commit)
+# Instructions_for_Cursor_Web2Book.docx
+
