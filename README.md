@@ -16,6 +16,10 @@ mvn clean package
 java -jar target/web2book-1.0.0.jar
 
 
+## Build windows dist
+./build-windows-package.sh
+
+
 ## TO DO
 
 Done. Generate books as soon as their chapters are ready

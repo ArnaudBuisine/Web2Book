@@ -73,6 +73,7 @@
                             <goal>shade</goal>
                         </goals>
                         <configuration>
+                            <finalName>web2book</finalName>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>org.web2book.Web2BookApp</mainClass>

@@ -61,8 +61,11 @@ public class Web2BookApp {
         fontProviderLogger.setLevel(java.util.logging.Level.OFF);
         fontProviderLogger.setUseParentHandlers(false);
         
-        System.out.println("Web2Book - Manga to Book Converter");
-        System.out.println("===================================");
+        System.out.println("=======================================");
+        System.out.println("Web2Book - Web Manga to Book Converter");
+        System.out.println("=======================================");
+        System.out.println("v1.2");
+        System.out.println("=======================================");
         
         // Load global configuration
         Properties globalProps = loadGlobalConfig();
