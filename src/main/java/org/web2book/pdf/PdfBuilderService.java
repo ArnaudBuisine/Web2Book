@@ -210,11 +210,12 @@ public class PdfBuilderService {
      * 
      * @param chapterContent The chapter content including images and HTML
      * @param chapterTitle The title for this chapter
+     * @param failedFilenames Set of image filenames that failed to download (for placeholders)
      */
-    public void addChapter(ChapterContent chapterContent, String chapterTitle) {
+    public void addChapter(ChapterContent chapterContent, String chapterTitle, java.util.Set<String> failedFilenames) {
         try {
             List<Path> imageFiles = chapterContent.getImageFiles();
-            if (imageFiles.isEmpty()) {
+            if (imageFiles.isEmpty() && (failedFilenames == null || failedFilenames.isEmpty())) {
                 logger.warning("No images found for chapter " + chapterTitle);
                 return;
             }
@@ -224,7 +225,7 @@ public class PdfBuilderService {
             int pageNumber = document.getNumberOfPages() + 1;
             
             // Add all images to a single long page with chapter title
-            addChapterImagesPage(imageFiles, chapterTitle);
+            addChapterImagesPage(imageFiles, chapterTitle, failedFilenames);
             
             // Track chapter for TOC (page number is now correct after page was added)
             chapters.add(new ChapterInfo(chapterTitle, pageNumber));
@@ -554,6 +555,30 @@ public class PdfBuilderService {
     }
 
     /**
+     * Helper class to represent either an image or a placeholder.
+     */
+    private static class ImageItem {
+        final PDImageXObject image;
+        final String placeholderText;
+        final String filename;
+        final boolean isPlaceholder;
+        
+        ImageItem(PDImageXObject image, String filename) {
+            this.image = image;
+            this.placeholderText = null;
+            this.filename = filename;
+            this.isPlaceholder = false;
+        }
+        
+        ImageItem(String placeholderText, String filename) {
+            this.image = null;
+            this.placeholderText = placeholderText;
+            this.filename = filename;
+            this.isPlaceholder = true;
+        }
+    }
+    
+    /**
      * Adds all images from a chapter to a single long page.
      * Images are stacked vertically, each using full width (A4 width, no margins).
      * Chapter title is added at the top of the page.
@@ -561,8 +586,9 @@ public class PdfBuilderService {
      * 
      * @param imageFiles List of image files to add
      * @param chapterTitle Title of the chapter to display at the top
+     * @param failedFilenames Set of image filenames that failed to download (for placeholders)
      */
-    private void addChapterImagesPage(List<Path> imageFiles, String chapterTitle) throws IOException {
+    private void addChapterImagesPage(List<Path> imageFiles, String chapterTitle, java.util.Set<String> failedFilenames) throws IOException {
         // Ensure images are sorted by numeric filename (e.g., "1.jpg", "2.jpg", "10.jpg")
         // This prevents ordering issues when images are loaded from disk
         List<Path> sortedImageFiles = new java.util.ArrayList<>(imageFiles);
@@ -581,8 +607,8 @@ public class PdfBuilderService {
             return 0;
         }));
         
-        // First pass: load all images and calculate total height needed
-        java.util.List<PDImageXObject> images = new java.util.ArrayList<>();
+        // Structure to hold image items (either actual images or placeholders)
+        java.util.List<ImageItem> imageItems = new java.util.ArrayList<>();
         float totalHeight = 0f;
         
         // Add space for chapter title at the top - reserve more space to ensure visibility
@@ -593,11 +619,28 @@ public class PdfBuilderService {
         float titleHeight = titleTopMargin + titleFontSize + titleBottomMargin; // Total: 94f
         totalHeight += titleHeight;
         
+        // Placeholder text height (approximate)
+        float placeholderHeight = 30f; // Height for placeholder text
+        
+        // Process existing image files
         for (Path imageFile : sortedImageFiles) {
+            String filename = imageFile.getFileName().toString();
             try {
+                if (!Files.exists(imageFile)) {
+                    // File doesn't exist - check if it's a failed download
+                    if (failedFilenames != null && failedFilenames.contains(filename)) {
+                        imageItems.add(new ImageItem("[Image could not be downloaded: " + filename + "]", filename));
+                        totalHeight += placeholderHeight;
+                    } else {
+                        imageItems.add(new ImageItem("[Image can not be read: " + filename + "]", filename));
+                        totalHeight += placeholderHeight;
+                    }
+                    continue;
+                }
+                
                 byte[] imageBytes = Files.readAllBytes(imageFile);
-                PDImageXObject pdImage = PDImageXObject.createFromByteArray(document, imageBytes, imageFile.getFileName().toString());
-                images.add(pdImage);
+                PDImageXObject pdImage = PDImageXObject.createFromByteArray(document, imageBytes, filename);
+                imageItems.add(new ImageItem(pdImage, filename));
                 
                 // Calculate scaled dimensions for full width
                 float imageWidth = pdImage.getWidth();
@@ -609,12 +652,54 @@ public class PdfBuilderService {
                 
                 totalHeight += scaledHeight;
             } catch (IOException e) {
+                // Image can't be read from filesystem
                 logger.warning("Failed to load image " + imageFile + ": " + e.getMessage());
+                imageItems.add(new ImageItem("[Image can not be read: " + filename + "]", filename));
+                totalHeight += placeholderHeight;
+            } catch (Exception e) {
+                // Unsupported image type or other error
+                String errorMsg = e.getMessage();
+                if (errorMsg != null && errorMsg.contains("Image type") && errorMsg.contains("not supported")) {
+                    logger.severe("Image type not supported: " + filename + " - " + errorMsg);
+                    imageItems.add(new ImageItem("[Image type UNKNOWN not supported: " + filename + "]", filename));
+                } else {
+                    logger.severe("Failed to process image " + filename + ": " + errorMsg);
+                    imageItems.add(new ImageItem("[Image can not be read: " + filename + "]", filename));
+                }
+                totalHeight += placeholderHeight;
             }
         }
         
-        if (images.isEmpty()) {
-            logger.warning("No valid images found for chapter " + chapterTitle);
+        // Add placeholders for failed downloads that don't have corresponding files
+        if (failedFilenames != null) {
+            for (String failedFilename : failedFilenames) {
+                // Check if we already processed this filename
+                boolean alreadyProcessed = imageItems.stream()
+                    .anyMatch(item -> item.filename.equals(failedFilename));
+                if (!alreadyProcessed) {
+                    imageItems.add(new ImageItem("[Image could not be downloaded: " + failedFilename + "]", failedFilename));
+                    totalHeight += placeholderHeight;
+                }
+            }
+        }
+        
+        // Sort image items by filename to maintain order
+        imageItems.sort(java.util.Comparator.comparing(item -> {
+            String name = item.filename;
+            try {
+                int dotIndex = name.lastIndexOf('.');
+                if (dotIndex > 0) {
+                    String numberPart = name.substring(0, dotIndex);
+                    return Integer.parseInt(numberPart);
+                }
+            } catch (NumberFormatException e) {
+                // If not a number, use 0
+            }
+            return 0;
+        }));
+        
+        if (imageItems.isEmpty()) {
+            logger.warning("No images or placeholders found for chapter " + chapterTitle);
             return;
         }
         
@@ -663,27 +748,55 @@ public class PdfBuilderService {
                 currentY = totalHeight - titleTopMargin - titleFontSize - titleBottomMargin;
             }
             
-            // Draw all images stacked vertically
-            for (PDImageXObject pdImage : images) {
-                float imageWidth = pdImage.getWidth();
-                float imageHeight = pdImage.getHeight();
-                
-                // Scale to full page width while maintaining aspect ratio
-                float scale = CONTENT_WIDTH / imageWidth;
-                float scaledWidth = CONTENT_WIDTH;
-                float scaledHeight = imageHeight * scale;
-                
-                // Position image at current Y
-                currentY -= scaledHeight;
-                float x = MARGIN; // 0, but keeping for clarity
-                float y = currentY;
-                
-                // Draw image at full width
-                contentStream.drawImage(pdImage, x, y, scaledWidth, scaledHeight);
+            // Draw all images and placeholders stacked vertically
+            PDType1Font regularFont = getRegularFont();
+            for (ImageItem item : imageItems) {
+                if (item.isPlaceholder) {
+                    // Draw placeholder text
+                    if (regularFont != null) {
+                        try {
+                            contentStream.setNonStrokingColor(0.5f, 0.5f, 0.5f); // Gray color for placeholders
+                            contentStream.beginText();
+                            contentStream.setFont(regularFont, 12f);
+                            float textWidth = regularFont.getStringWidth(item.placeholderText) / 1000f * 12f;
+                            float textX = (PAGE_WIDTH - textWidth) / 2f;
+                            currentY -= placeholderHeight;
+                            contentStream.newLineAtOffset(textX, currentY);
+                            contentStream.showText(item.placeholderText);
+                            contentStream.endText();
+                            contentStream.setNonStrokingColor(0, 0, 0); // Reset to black
+                        } catch (Exception e) {
+                            logger.warning("Failed to draw placeholder text: " + e.getMessage());
+                            currentY -= placeholderHeight;
+                        }
+                    } else {
+                        currentY -= placeholderHeight;
+                    }
+                } else {
+                    // Draw actual image
+                    PDImageXObject pdImage = item.image;
+                    float imageWidth = pdImage.getWidth();
+                    float imageHeight = pdImage.getHeight();
+                    
+                    // Scale to full page width while maintaining aspect ratio
+                    float scale = CONTENT_WIDTH / imageWidth;
+                    float scaledWidth = CONTENT_WIDTH;
+                    float scaledHeight = imageHeight * scale;
+                    
+                    // Position image at current Y
+                    currentY -= scaledHeight;
+                    float x = MARGIN; // 0, but keeping for clarity
+                    float y = currentY;
+                    
+                    // Draw image at full width
+                    contentStream.drawImage(pdImage, x, y, scaledWidth, scaledHeight);
+                }
             }
         }
         
-        logger.info("Added " + images.size() + " images to chapter page with title (total height: " + totalHeight + " points)");
+        int imageCount = (int) imageItems.stream().filter(item -> !item.isPlaceholder).count();
+        int placeholderCount = (int) imageItems.stream().filter(item -> item.isPlaceholder).count();
+        logger.info("Added " + imageCount + " images and " + placeholderCount + " placeholders to chapter page with title (total height: " + totalHeight + " points)");
     }
 
     /**

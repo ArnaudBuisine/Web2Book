@@ -249,9 +249,21 @@ public class HttpClientService {
 
     private byte[] downloadBinaryInternal(String url) {
         Exception lastException = null;
+        long downloadStartTime = System.currentTimeMillis();
+        
+        logger.finest("downloadBinaryInternal: Starting download for URL: " + url);
         
         for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            long attemptStartTime = System.currentTimeMillis();
             try {
+                if (attempt > 1) {
+                    logger.finest("downloadBinaryInternal: Retry attempt " + attempt + "/" + MAX_RETRIES + 
+                        " for URL: " + url + " (previous attempt failed after " + 
+                        (attemptStartTime - downloadStartTime) + "ms)");
+                } else {
+                    logger.finest("downloadBinaryInternal: Attempt " + attempt + "/" + MAX_RETRIES + " for URL: " + url);
+                }
+                
                 HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
                         .uri(URI.create(url))
                         .timeout(TIMEOUT)
@@ -265,23 +277,37 @@ public class HttpClientService {
                 // Add Referer for image downloads
                 if (refererUrl != null) {
                     requestBuilder.header("Referer", refererUrl);
+                    logger.finest("downloadBinaryInternal: Added Referer header: " + refererUrl);
                 }
                 
                 HttpRequest request = requestBuilder.GET().build();
+                logger.finest("downloadBinaryInternal: Sending HTTP request (timeout: " + TIMEOUT.getSeconds() + "s)");
 
+                long sendStartTime = System.currentTimeMillis();
                 HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+                long sendDuration = System.currentTimeMillis() - sendStartTime;
+                
+                logger.finest("downloadBinaryInternal: Received HTTP response in " + sendDuration + "ms, " +
+                    "status: " + response.statusCode() + ", body size: " + 
+                    (response.body() != null ? response.body().length : 0) + " bytes");
                 
                 if (response.statusCode() == 200) {
+                    long totalDuration = System.currentTimeMillis() - downloadStartTime;
+                    logger.finest("downloadBinaryInternal: Successfully downloaded " + 
+                        response.body().length + " bytes in " + totalDuration + "ms (attempt " + attempt + ")");
                     return response.body();
                 } else {
                     throw new IOException("HTTP " + response.statusCode() + " for URL: " + url);
                 }
             } catch (java.net.http.HttpTimeoutException e) {
                 lastException = e;
+                long attemptDuration = System.currentTimeMillis() - attemptStartTime;
+                logger.finest("downloadBinaryInternal: Timeout exception after " + attemptDuration + "ms on attempt " + attempt);
                 if (attempt < MAX_RETRIES) {
-                    logger.warning(String.format("Attempt %d/%d failed for binary download %s: request timed out. Retrying in %d ms...", 
-                        attempt, MAX_RETRIES, url, RETRY_DELAY_MS));
+                    logger.warning(String.format("Attempt %d/%d failed for binary download %s: request timed out after %dms. Retrying in %d ms...", 
+                        attempt, MAX_RETRIES, url, attemptDuration, RETRY_DELAY_MS));
                     try {
+                        logger.finest("downloadBinaryInternal: Sleeping for " + RETRY_DELAY_MS + "ms before retry");
                         Thread.sleep(RETRY_DELAY_MS);
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
@@ -289,15 +315,19 @@ public class HttpClientService {
                         return null;
                     }
                 } else {
-                    logger.severe(String.format("Attempt %d/%d failed for binary download %s: request timed out (final attempt)", 
-                        attempt, MAX_RETRIES, url));
+                    logger.severe(String.format("Attempt %d/%d failed for binary download %s: request timed out after %dms (final attempt)", 
+                        attempt, MAX_RETRIES, url, attemptDuration));
                 }
             } catch (Exception e) {
                 lastException = e;
+                long attemptDuration = System.currentTimeMillis() - attemptStartTime;
+                logger.finest("downloadBinaryInternal: Exception after " + attemptDuration + "ms on attempt " + 
+                    attempt + ": " + e.getClass().getSimpleName() + " - " + e.getMessage());
                 if (attempt < MAX_RETRIES) {
-                    logger.warning(String.format("Attempt %d/%d failed for binary download %s: %s. Retrying in %d ms...", 
-                        attempt, MAX_RETRIES, url, e.getMessage(), RETRY_DELAY_MS));
+                    logger.warning(String.format("Attempt %d/%d failed for binary download %s: %s (after %dms). Retrying in %d ms...", 
+                        attempt, MAX_RETRIES, url, e.getMessage(), attemptDuration, RETRY_DELAY_MS));
                     try {
+                        logger.finest("downloadBinaryInternal: Sleeping for " + RETRY_DELAY_MS + "ms before retry");
                         Thread.sleep(RETRY_DELAY_MS);
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
@@ -305,15 +335,17 @@ public class HttpClientService {
                         return null;
                     }
                 } else {
-                    logger.severe(String.format("Attempt %d/%d failed for binary download %s: %s (final attempt)", 
-                        attempt, MAX_RETRIES, url, e.getMessage()));
+                    logger.severe(String.format("Attempt %d/%d failed for binary download %s: %s (after %dms, final attempt)", 
+                        attempt, MAX_RETRIES, url, e.getMessage(), attemptDuration));
                 }
             }
         }
         
-        String errorMsg = String.format("Failed to download binary %s after %d attempts: %s", 
-            url, MAX_RETRIES, lastException != null ? lastException.getMessage() : "Unknown error");
+        long totalDuration = System.currentTimeMillis() - downloadStartTime;
+        String errorMsg = String.format("Failed to download binary %s after %d attempts (%dms total): %s", 
+            url, MAX_RETRIES, totalDuration, lastException != null ? lastException.getMessage() : "Unknown error");
         logger.severe(errorMsg);
+        logger.finest("downloadBinaryInternal: Total download time: " + totalDuration + "ms");
         return null;
     }
 }

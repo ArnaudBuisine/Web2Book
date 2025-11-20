@@ -44,13 +44,13 @@ public class LoggerFactory {
             
             // Create logger
             Logger logger = Logger.getLogger(loggerName);
-            logger.setLevel(Level.ALL);
+            logger.setLevel(Level.FINEST); // Set to FINEST (equivalent to TRACE) for maximum detail
             logger.setUseParentHandlers(false); // Disable console output
             
             // Create file handler
             FileHandler fileHandler = new FileHandler(logFile.toString(), true);
             fileHandler.setFormatter(new SimpleFormatter());
-            fileHandler.setLevel(Level.ALL);
+            fileHandler.setLevel(Level.FINEST); // Set to FINEST for maximum detail
             
             logger.addHandler(fileHandler);
             

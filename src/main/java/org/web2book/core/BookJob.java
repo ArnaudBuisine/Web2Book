@@ -21,6 +21,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -36,11 +37,28 @@ public class BookJob {
     private Properties bookProps;
     private Path outputDir;
     private Path logDir;
+    private Path tempDir;
     private long thinkingTimeMs;
     private String outputFormat;
     private Logger logger;
     private String bookTitle;
     private int maxConcurrentImageDownloads;
+    private boolean regenerateExistingBooks;
+    
+    // Track incomplete books with their failed image URLs
+    private static class IncompleteBook {
+        final String bookFilename;
+        final int bookIndex;
+        final List<String> failedUrls;
+        
+        IncompleteBook(String bookFilename, int bookIndex, List<String> failedUrls) {
+            this.bookFilename = bookFilename;
+            this.bookIndex = bookIndex;
+            this.failedUrls = new ArrayList<>(failedUrls);
+        }
+    }
+    
+    private final List<IncompleteBook> incompleteBooks = new ArrayList<>();
 
     public BookJob(Path bookConfigPath, Properties globalProps, HttpClientService httpClientService) {
         this.bookConfigPath = bookConfigPath;
@@ -73,6 +91,9 @@ public class BookJob {
             
             // Ensure log directory exists
             Files.createDirectories(logDir);
+            
+            // Ensure temp directory exists
+            Files.createDirectories(tempDir);
             
             // Initialize logger
             String loggerName = "web2book." + LoggerFactory.sanitizeFilename(bookTitle);
@@ -295,6 +316,15 @@ public class BookJob {
             }
         }
         
+        // Resolve temp directory
+        String bookTempDir = bookProps.getProperty("temp.dir");
+        if (bookTempDir != null && !bookTempDir.trim().isEmpty()) {
+            tempDir = Paths.get(bookTempDir);
+        } else {
+            String defaultTempDir = globalProps.getProperty("default.temp.dir", "tmp");
+            tempDir = Paths.get(defaultTempDir);
+        }
+        
         // Resolve max concurrent image downloads
         String bookMaxConcurrent = bookProps.getProperty("max.concurrent.image.downloads");
         if (bookMaxConcurrent != null && !bookMaxConcurrent.trim().isEmpty()) {
@@ -344,47 +374,69 @@ public class BookJob {
                 maxConcurrentImageDownloads = 4;
             }
         }
+        
+        // Resolve regenerate existing books setting
+        String bookRegenerate = bookProps.getProperty("regenerate.existing.books");
+        if (bookRegenerate != null && !bookRegenerate.trim().isEmpty()) {
+            regenerateExistingBooks = "true".equalsIgnoreCase(bookRegenerate.trim());
+        } else {
+            String defaultRegenerate = globalProps.getProperty("default.regenerate.existing.books", "false");
+            regenerateExistingBooks = "true".equalsIgnoreCase(defaultRegenerate.trim());
+        }
     }
 
-    private void processVolumes(List<ChapterInfo> chapters, int maxChaptersPerBook) {
-        // Process all chapters and track successfully processed ones
-        List<ChapterContent> allSuccessfullyProcessed = new ArrayList<>();
+    /**
+     * Result of processing chapters, including processed chapters and failed image URLs/filenames.
+     */
+    private static class ProcessChaptersResult {
+        final List<ChapterContent> processedChapters;
+        final List<String> failedUrls;
+        final java.util.Map<Integer, java.util.Set<String>> failedFilenamesByChapter; // Chapter number -> Set of failed filenames
+        
+        ProcessChaptersResult(List<ChapterContent> processedChapters, List<String> failedUrls, 
+                java.util.Map<Integer, java.util.Set<String>> failedFilenamesByChapter) {
+            this.processedChapters = processedChapters;
+            this.failedUrls = failedUrls;
+            this.failedFilenamesByChapter = failedFilenamesByChapter;
+        }
+    }
+    
+    /**
+     * Processes a list of chapters and returns the successfully processed ChapterContent list and failed URLs.
+     * 
+     * @param chapters The chapters to process
+     * @param tmpImagesDir The temporary images directory
+     * @param tmpHtmlDir The temporary HTML directory
+     * @param totalChaptersOverall Total number of chapters across all books
+     * @param chaptersProcessedBefore Number of chapters already processed in previous books
+     * @return ProcessChaptersResult containing processed chapters and failed URLs
+     */
+    private ProcessChaptersResult processChapters(List<ChapterInfo> chapters, Path tmpImagesDir, Path tmpHtmlDir,
+            int totalChaptersOverall, int chaptersProcessedBefore) {
+        List<ChapterContent> processedChapters = new ArrayList<>();
+        List<String> allFailedUrls = new ArrayList<>();
+        java.util.Map<Integer, java.util.Set<String>> failedFilenamesByChapter = new java.util.HashMap<>();
         Random random = new Random();
         
-        Path tmpImagesDir = outputDir.resolve("tmp").resolve("images");
-        Path tmpHtmlDir = outputDir.resolve("tmp").resolve("html");
-        
-        try {
-            Files.createDirectories(tmpImagesDir);
-            Files.createDirectories(tmpHtmlDir);
-        } catch (IOException e) {
-            String errorMsg = "Failed to create temporary directories: " + e.getMessage();
-            logger.severe(errorMsg);
-            System.err.println("ERROR: " + errorMsg);
-            return;
-        }
-        
-        // Track total processing time
-        long totalStartTime = System.currentTimeMillis();
-        
-        // Process each chapter sequentially
-        int totalChapters = chapters.size();
         int processedCount = 0;
+        
         for (ChapterInfo chapterInfo : chapters) {
             // Track chapter processing time
             long chapterStartTime = System.currentTimeMillis();
             
             try {
                 processedCount++;
-                int percentage = (int) Math.round((processedCount * 100.0) / totalChapters);
-                String msg = "Processing chapter " + chapterInfo.getChapterNumber() + " (" + percentage + "%)";
-                logger.info("Processing chapter " + chapterInfo.getChapterNumber());
+                // Calculate overall progress: (chapters processed before + current chapter) / total chapters overall
+                int overallProcessed = chaptersProcessedBefore + processedCount;
+                int percentage = (int) Math.round((overallProcessed * 100.0) / totalChaptersOverall);
+                String msg = "Processing chapter " + chapterInfo.getChapterNumber() + " (" + percentage + "% overall)";
+                logger.info("Processing chapter " + chapterInfo.getChapterNumber() + " (" + percentage + "% overall)");
                 System.out.println(msg);
                 
                 // Check if chapter already exists
                 ChapterContent existingChapter = loadExistingChapter(chapterInfo, tmpHtmlDir, tmpImagesDir);
                 if (existingChapter != null) {
-                    allSuccessfullyProcessed.add(existingChapter);
+                    processedChapters.add(existingChapter);
                     logger.info("Skipped processing chapter " + chapterInfo.getChapterNumber() + " (already exists)");
                     continue; // Skip thinking time and move to next chapter
                 }
@@ -402,7 +454,7 @@ public class BookJob {
                         chapterInfo.getChapterNumber() + ", stopping further downloads.";
                     logger.severe(errorMsg);
                     System.err.println("ERROR: " + errorMsg);
-                    logger.info("Will generate EPUB volumes for " + allSuccessfullyProcessed.size() + 
+                    logger.info("Will generate book for " + processedChapters.size() + 
                         " successfully processed chapters only.");
                     break; // Stop processing further chapters
                 }
@@ -423,8 +475,19 @@ public class BookJob {
                 Path chapterImagesDir = tmpImagesDir.resolve(String.valueOf(chapterInfo.getChapterNumber()));
                 Files.createDirectories(chapterImagesDir);
                 
-                List<Path> downloadedImages = downloadImages(imageUrls, chapterImagesDir, chapterInfo.getChapterNumber(), 
-                    processedCount, totalChapters);
+                // Calculate overall chapter index for progress tracking
+                int overallChapterIndex = chaptersProcessedBefore + processedCount;
+                DownloadResult downloadResult = downloadImages(imageUrls, chapterImagesDir, chapterInfo.getChapterNumber(), 
+                    overallChapterIndex, totalChaptersOverall);
+                
+                List<Path> downloadedImages = downloadResult.downloadedImages;
+                allFailedUrls.addAll(downloadResult.failedUrls);
+                
+                // Track failed filenames for this chapter
+                if (!downloadResult.failedUrlToFilename.isEmpty()) {
+                    java.util.Set<String> failedFilenames = new java.util.HashSet<>(downloadResult.failedUrlToFilename.values());
+                    failedFilenamesByChapter.put(chapterInfo.getChapterNumber(), failedFilenames);
+                }
                 
                 if (downloadedImages.isEmpty()) {
                     logger.warning("Chapter " + chapterInfo.getChapterNumber() + 
@@ -445,11 +508,15 @@ public class BookJob {
                     chapterInfo.getChapterNumber(), 
                     bookProps);
                 
+                // Get failed filenames for this chapter
+                java.util.Set<String> chapterFailedFilenames = failedFilenamesByChapter.getOrDefault(
+                    chapterInfo.getChapterNumber(), new java.util.HashSet<>());
+                
                 Path chapterHtmlFile = createChapterHtml(chapterTitle, downloadedImages, 
-                    chapterInfo.getChapterNumber(), tmpHtmlDir);
+                    chapterInfo.getChapterNumber(), tmpHtmlDir, chapterFailedFilenames);
                 
                 ChapterContent chapterContent = new ChapterContent(chapterInfo, downloadedImages, chapterHtmlFile);
-                allSuccessfullyProcessed.add(chapterContent);
+                processedChapters.add(chapterContent);
                 
                 // Calculate and log chapter duration
                 long chapterDuration = System.currentTimeMillis() - chapterStartTime;
@@ -477,40 +544,31 @@ public class BookJob {
             }
         }
         
-        // Log total processing duration
-        long totalDuration = System.currentTimeMillis() - totalStartTime;
-        String totalDurationStr = formatDuration(totalDuration);
-        logger.info("Total processing duration: " + totalDurationStr);
-        
-        // Check if we have any successfully processed chapters
-        if (allSuccessfullyProcessed.isEmpty()) {
-            logger.warning("No chapters were successfully processed, skipping EPUB generation for this book.");
-            cleanup(tmpImagesDir, tmpHtmlDir);
+        return new ProcessChaptersResult(processedChapters, allFailedUrls, failedFilenamesByChapter);
+    }
+    
+    /**
+     * Generates a book from a list of processed chapters.
+     * 
+     * @param bookChapters The processed chapters for this book
+     * @param bookIndex The index of this book (1-based)
+     * @param totalBooks The total number of books
+     * @param failedUrls List of failed image URLs for this book (null or empty if none)
+     * @param failedFilenamesByChapter Map of chapter number to set of failed image filenames
+     */
+    private void generateBook(List<ChapterContent> bookChapters, int bookIndex, int totalBooks, List<String> failedUrls,
+            java.util.Map<Integer, java.util.Set<String>> failedFilenamesByChapter) {
+        if (bookChapters.isEmpty()) {
+            logger.warning("No chapters to generate book " + bookIndex + ", skipping.");
             return;
         }
         
-        // Split into volumes
-        int totalProcessed = allSuccessfullyProcessed.size();
-        int volumeCount = (int) Math.ceil((double) totalProcessed / maxChaptersPerBook);
-        
-        logger.info("Splitting " + totalProcessed + " successfully processed chapters into " + 
-            volumeCount + " volumes (max " + maxChaptersPerBook + " chapters per volume)");
-        
-        for (int volumeIndex = 0; volumeIndex < volumeCount; volumeIndex++) {
-            int startIdx = volumeIndex * maxChaptersPerBook;
-            int endIdx = Math.min(startIdx + maxChaptersPerBook, allSuccessfullyProcessed.size());
-            List<ChapterContent> volumeChapters = allSuccessfullyProcessed.subList(startIdx, endIdx);
-            
-            if (volumeChapters.isEmpty()) {
-                continue; // Skip empty volumes
-            }
-            
-            // Calculate effective chapter range for this volume
-            int effectiveStart = volumeChapters.stream()
+        // Calculate effective chapter range for this book
+        int effectiveStart = bookChapters.stream()
                 .mapToInt(c -> c.getInfo().getChapterNumber())
                 .min()
                 .orElse(0);
-            int effectiveEnd = volumeChapters.stream()
+        int effectiveEnd = bookChapters.stream()
                 .mapToInt(c -> c.getInfo().getChapterNumber())
                 .max()
                 .orElse(0);
@@ -521,7 +579,7 @@ public class BookJob {
             adjustedProps.setProperty("chapter.end", String.valueOf(effectiveEnd));
             
             // Generate title for PDF display (using book.title.template)
-            String volumeTitle = TemplateEngine.applyBookTitleTemplate(
+        String bookTitle = TemplateEngine.applyBookTitleTemplate(
                 bookProps.getProperty("book.title.template"), adjustedProps);
             
             // Generate filename for saving (using book.filename.template, fallback to book.title.template)
@@ -529,17 +587,25 @@ public class BookJob {
             if (filenameTemplate == null || filenameTemplate.isEmpty()) {
                 filenameTemplate = bookProps.getProperty("book.title.template", "");
             }
-            String volumeFilename = TemplateEngine.applyBookTitleTemplate(filenameTemplate, adjustedProps);
-            logger.info("Creating volume " + (volumeIndex + 1) + "/" + volumeCount + 
+        String bookFilename = TemplateEngine.applyBookTitleTemplate(filenameTemplate, adjustedProps);
+        
+        // Add -INCOMPLETE suffix if there are failed image downloads
+        if (failedUrls != null && !failedUrls.isEmpty()) {
+            bookFilename = bookFilename + " - INCOMPLETE";
+            logger.warning("Book " + bookIndex + " has " + failedUrls.size() + " failed image downloads, adding -INCOMPLETE suffix");
+            incompleteBooks.add(new IncompleteBook(bookFilename, bookIndex, failedUrls));
+        }
+        
+        logger.info("Generating book " + bookIndex + "/" + totalBooks + 
                 ": Chapters " + effectiveStart + " to " + effectiveEnd);
             
-            // Add chapters to this volume
+        // Generate the book
             if (outputFormat.equals("pdf")) {
-                PdfBuilderService pdfBuilder = new PdfBuilderService(volumeTitle, logger, adjustedProps);
+            PdfBuilderService pdfBuilder = new PdfBuilderService(bookTitle, logger, adjustedProps);
                 
                 // Collect all chapter titles first for TOC
                 List<String> chapterTitles = new ArrayList<>();
-                for (ChapterContent chapterContent : volumeChapters) {
+            for (ChapterContent chapterContent : bookChapters) {
                     String chapterTitle = TemplateEngine.applyChapterTitleTemplate(
                         bookProps.getProperty("chapter.title.template"), 
                         chapterContent.getInfo().getChapterNumber(), 
@@ -551,50 +617,59 @@ public class BookJob {
                 pdfBuilder.addTitlePage(chapterTitles);
                 
                 // Then add all chapters
-                for (int i = 0; i < volumeChapters.size(); i++) {
-                    ChapterContent chapterContent = volumeChapters.get(i);
-                    pdfBuilder.addChapter(chapterContent, chapterTitles.get(i));
+            for (int i = 0; i < bookChapters.size(); i++) {
+                ChapterContent chapterContent = bookChapters.get(i);
+                int chapterNumber = chapterContent.getInfo().getChapterNumber();
+                java.util.Set<String> failedFilenames = failedFilenamesByChapter.getOrDefault(chapterNumber, new java.util.HashSet<>());
+                pdfBuilder.addChapter(chapterContent, chapterTitles.get(i), failedFilenames);
                 }
                 
                 // Save PDF (use filename template for the file, title template is already used in PDF)
                 try {
-                    Path pdfFile = pdfBuilder.saveTo(outputDir, volumeFilename);
+                Path pdfFile = pdfBuilder.saveTo(outputDir, bookFilename);
                     logger.info("PDF created: " + pdfFile.toAbsolutePath());
-                    logger.info("Volume " + (volumeIndex + 1) + " contains " + volumeChapters.size() + 
+                logger.info("Book " + bookIndex + " contains " + bookChapters.size() + 
                         " chapters (range: " + effectiveStart + " to " + effectiveEnd + ")");
                 } catch (IOException e) {
-                    logger.severe("Failed to save PDF volume " + (volumeIndex + 1) + ": " + e.getMessage());
+                logger.severe("Failed to save PDF book " + bookIndex + ": " + e.getMessage());
                 }
             } else {
                 // EPUB format
-                EpubBuilderService epubBuilder = new EpubBuilderService(volumeTitle, logger, adjustedProps);
-                for (ChapterContent chapterContent : volumeChapters) {
+            EpubBuilderService epubBuilder = new EpubBuilderService(bookTitle, logger, adjustedProps);
+            for (ChapterContent chapterContent : bookChapters) {
                     String chapterTitle = TemplateEngine.applyChapterTitleTemplate(
                         bookProps.getProperty("chapter.title.template"), 
                         chapterContent.getInfo().getChapterNumber(), 
                         bookProps);
-                    epubBuilder.addChapter(chapterContent, chapterTitle);
+                int chapterNumber = chapterContent.getInfo().getChapterNumber();
+                java.util.Set<String> failedFilenames = failedFilenamesByChapter.getOrDefault(chapterNumber, new java.util.HashSet<>());
+                epubBuilder.addChapter(chapterContent, chapterTitle, failedFilenames);
                 }
                 
                 // Save EPUB (use filename template for the file, title template is already used in EPUB)
                 try {
-                    Path epubFile = epubBuilder.saveTo(outputDir, volumeFilename);
+                Path epubFile = epubBuilder.saveTo(outputDir, bookFilename);
                     logger.info("EPUB created: " + epubFile.toAbsolutePath());
-                    logger.info("Volume " + (volumeIndex + 1) + " contains " + volumeChapters.size() + 
+                logger.info("Book " + bookIndex + " contains " + bookChapters.size() + 
                         " chapters (range: " + effectiveStart + " to " + effectiveEnd + ")");
                 } catch (IOException e) {
-                    logger.severe("Failed to save EPUB volume " + (volumeIndex + 1) + ": " + e.getMessage());
-                }
+                logger.severe("Failed to save EPUB book " + bookIndex + ": " + e.getMessage());
             }
         }
-        
-        // Cleanup
-        cleanup(tmpImagesDir, tmpHtmlDir);
     }
-
-    private void processSingleVolume(List<ChapterInfo> chapters, String volumeTitle) {
-        Path tmpImagesDir = outputDir.resolve("tmp").resolve("images");
-        Path tmpHtmlDir = outputDir.resolve("tmp").resolve("html");
+    
+    private void processVolumes(List<ChapterInfo> chapters, int maxChaptersPerBook) {
+        // Calculate how many books we need
+        int totalChapters = chapters.size();
+        int totalBooks = (int) Math.ceil((double) totalChapters / maxChaptersPerBook);
+        
+        logger.info("Processing " + totalChapters + " chapters into " + totalBooks + 
+            " books (max " + maxChaptersPerBook + " chapters per book)");
+        System.out.println("Processing " + totalChapters + " chapters into " + totalBooks + 
+            " books (max " + maxChaptersPerBook + " chapters per book)");
+        
+        Path tmpImagesDir = tempDir.resolve("images");
+        Path tmpHtmlDir = tempDir.resolve("html");
         
         try {
             Files.createDirectories(tmpImagesDir);
@@ -606,8 +681,121 @@ public class BookJob {
             return;
         }
         
-        // Track successfully processed chapters
+        // Track overall progress across all books
+        int chaptersProcessedSoFar = 0;
+        
+        // Process each book sequentially
+        for (int bookIndex = 0; bookIndex < totalBooks; bookIndex++) {
+            int startIdx = bookIndex * maxChaptersPerBook;
+            int endIdx = Math.min(startIdx + maxChaptersPerBook, totalChapters);
+            List<ChapterInfo> bookChapters = chapters.subList(startIdx, endIdx);
+            
+            if (bookChapters.isEmpty()) {
+                continue; // Skip empty books
+            }
+            
+            // Calculate chapter range for this book
+            int bookStart = bookChapters.get(0).getChapterNumber();
+            int bookEnd = bookChapters.get(bookChapters.size() - 1).getChapterNumber();
+            
+            logger.info("=== Processing Book " + (bookIndex + 1) + "/" + totalBooks + 
+                ": Chapters " + bookStart + " to " + bookEnd + " ===");
+            System.out.println("\n=== Processing Book " + (bookIndex + 1) + "/" + totalBooks + 
+                ": Chapters " + bookStart + " to " + bookEnd + " ===");
+            
+            // Check if book already exists
+            if (!regenerateExistingBooks && bookFileExists(bookStart, bookEnd)) {
+                logger.info("Book " + (bookIndex + 1) + " already exists (Chapters " + bookStart + 
+                    " to " + bookEnd + "). Skipping (regenerate.existing.books=false).");
+                System.out.println("Skipping book " + (bookIndex + 1) + "/" + totalBooks + 
+                    " - already exists (Chapters " + bookStart + " to " + bookEnd + ")");
+                // Update progress counter for skipped books
+                chaptersProcessedSoFar += bookChapters.size();
+                continue;
+            }
+            
+            // Process chapters for this book
+            long bookStartTime = System.currentTimeMillis();
+            ProcessChaptersResult processResult = processChapters(bookChapters, tmpImagesDir, tmpHtmlDir,
+                    totalChapters, chaptersProcessedSoFar);
+            List<ChapterContent> processedChapters = processResult.processedChapters;
+            List<String> failedUrls = processResult.failedUrls;
+            java.util.Map<Integer, java.util.Set<String>> failedFilenamesByChapter = processResult.failedFilenamesByChapter;
+            
+            // Update progress counter after processing this book
+            chaptersProcessedSoFar += processedChapters.size();
+            
+            if (processedChapters.isEmpty()) {
+                logger.warning("No chapters were successfully processed for book " + (bookIndex + 1) + ", skipping book generation.");
+                continue;
+            }
+            
+            // Generate the book immediately
+            generateBook(processedChapters, bookIndex + 1, totalBooks, failedUrls, failedFilenamesByChapter);
+            
+            // Log book processing duration
+            long bookDuration = System.currentTimeMillis() - bookStartTime;
+            String bookDurationStr = formatDuration(bookDuration);
+            logger.info("Completed book " + (bookIndex + 1) + "/" + totalBooks + 
+                " (duration: " + bookDurationStr + ")");
+        }
+        
+        logger.info("Completed processing all " + totalBooks + " books");
+        
+        // Cleanup at the end if configured
+        cleanup(tmpImagesDir, tmpHtmlDir);
+        
+        // Report incomplete books
+        if (!incompleteBooks.isEmpty()) {
+            logger.warning("=== INCOMPLETE BOOKS REPORT ===");
+            logger.warning("Total incomplete books: " + incompleteBooks.size());
+            System.out.println("\n=== INCOMPLETE BOOKS REPORT ===");
+            System.out.println("Total incomplete books: " + incompleteBooks.size());
+            
+            for (IncompleteBook incomplete : incompleteBooks) {
+                logger.warning("Book " + incomplete.bookIndex + ": " + incomplete.bookFilename);
+                logger.warning("  Failed image URLs (" + incomplete.failedUrls.size() + "):");
+                System.out.println("\nBook " + incomplete.bookIndex + ": " + incomplete.bookFilename);
+                System.out.println("  Failed image URLs (" + incomplete.failedUrls.size() + "):");
+                for (String failedUrl : incomplete.failedUrls) {
+                    logger.warning("    - " + failedUrl);
+                    System.out.println("    - " + failedUrl);
+                }
+            }
+            
+            logger.warning("=== END INCOMPLETE BOOKS REPORT ===");
+            System.out.println("\n=== END INCOMPLETE BOOKS REPORT ===");
+        } else {
+            logger.info("All books were generated successfully with all images downloaded.");
+            System.out.println("All books were generated successfully with all images downloaded.");
+        }
+    }
+
+    private void processSingleVolume(List<ChapterInfo> chapters, String volumeTitle) {
+        Path tmpImagesDir = tempDir.resolve("images");
+        Path tmpHtmlDir = tempDir.resolve("html");
+        
+        try {
+            Files.createDirectories(tmpImagesDir);
+            Files.createDirectories(tmpHtmlDir);
+        } catch (IOException e) {
+            String errorMsg = "Failed to create temporary directories: " + e.getMessage();
+            logger.severe(errorMsg);
+            System.err.println("ERROR: " + errorMsg);
+            return;
+        }
+        
+        // Calculate chapter range for visibility
+        int bookStart = chapters.get(0).getChapterNumber();
+        int bookEnd = chapters.get(chapters.size() - 1).getChapterNumber();
+        
+        logger.info("=== Processing Single Volume Book: Chapters " + bookStart + " to " + bookEnd + " ===");
+        System.out.println("\n=== Processing Single Volume Book: Chapters " + bookStart + " to " + bookEnd + " ===");
+        
+                // Track successfully processed chapters and failed URLs
         List<ChapterContent> successfullyProcessedChapters = new ArrayList<>();
+        List<String> allFailedUrls = new ArrayList<>();
+        java.util.Map<Integer, java.util.Set<String>> failedFilenamesByChapter = new java.util.HashMap<>();
         Random random = new Random();
         
         // Track total processing time
@@ -622,9 +810,10 @@ public class BookJob {
             
             try {
                 processedCount++;
+                // For single volume, calculate percentage based on total chapters
                 int percentage = (int) Math.round((processedCount * 100.0) / totalChapters);
                 String msg = "Processing chapter " + chapterInfo.getChapterNumber() + " (" + percentage + "%)";
-                logger.info("Processing chapter " + chapterInfo.getChapterNumber());
+                logger.info("Processing chapter " + chapterInfo.getChapterNumber() + " (" + percentage + "%)");
                 System.out.println(msg);
                 
                 // Check if chapter already exists
@@ -669,8 +858,19 @@ public class BookJob {
                 Path chapterImagesDir = tmpImagesDir.resolve(String.valueOf(chapterInfo.getChapterNumber()));
                 Files.createDirectories(chapterImagesDir);
                 
-                List<Path> downloadedImages = downloadImages(imageUrls, chapterImagesDir, chapterInfo.getChapterNumber(), 
+                // For single volume, use processedCount and totalChapters (local to this method)
+                DownloadResult downloadResult = downloadImages(imageUrls, chapterImagesDir, chapterInfo.getChapterNumber(), 
                     processedCount, totalChapters);
+                
+                List<Path> downloadedImages = downloadResult.downloadedImages;
+                allFailedUrls.addAll(downloadResult.failedUrls);
+                
+                // Track failed filenames for this chapter
+                java.util.Set<String> failedFilenames = new java.util.HashSet<>();
+                if (!downloadResult.failedUrlToFilename.isEmpty()) {
+                    failedFilenames = new java.util.HashSet<>(downloadResult.failedUrlToFilename.values());
+                    failedFilenamesByChapter.put(chapterInfo.getChapterNumber(), failedFilenames);
+                }
                 
                 if (downloadedImages.isEmpty()) {
                     logger.warning("Chapter " + chapterInfo.getChapterNumber() + 
@@ -692,7 +892,7 @@ public class BookJob {
                     bookProps);
                 
                 Path chapterHtmlFile = createChapterHtml(chapterTitle, downloadedImages, 
-                    chapterInfo.getChapterNumber(), tmpHtmlDir);
+                    chapterInfo.getChapterNumber(), tmpHtmlDir, failedFilenames);
                 
                 ChapterContent chapterContent = new ChapterContent(chapterInfo, downloadedImages, chapterHtmlFile);
                 successfullyProcessedChapters.add(chapterContent);
@@ -761,6 +961,13 @@ public class BookJob {
         }
         String adjustedFilename = TemplateEngine.applyBookTitleTemplate(filenameTemplate, adjustedProps);
         
+        // Add -INCOMPLETE suffix if there are failed image downloads
+        if (!allFailedUrls.isEmpty()) {
+            adjustedFilename = adjustedFilename + " - INCOMPLETE";
+            logger.warning("Single volume book has " + allFailedUrls.size() + " failed image downloads, adding -INCOMPLETE suffix");
+            incompleteBooks.add(new IncompleteBook(adjustedFilename, 1, allFailedUrls));
+        }
+        
         // Add all successfully processed chapters
         if (outputFormat.equals("pdf")) {
             PdfBuilderService pdfBuilder = new PdfBuilderService(adjustedTitle, logger, adjustedProps);
@@ -781,7 +988,9 @@ public class BookJob {
             // Then add all chapters
             for (int i = 0; i < successfullyProcessedChapters.size(); i++) {
                 ChapterContent chapterContent = successfullyProcessedChapters.get(i);
-                pdfBuilder.addChapter(chapterContent, chapterTitles.get(i));
+                int chapterNumber = chapterContent.getInfo().getChapterNumber();
+                java.util.Set<String> failedFilenames = failedFilenamesByChapter.getOrDefault(chapterNumber, new java.util.HashSet<>());
+                pdfBuilder.addChapter(chapterContent, chapterTitles.get(i), failedFilenames);
             }
             
             // Save PDF (use filename template for the file, title template is already used in PDF)
@@ -801,7 +1010,9 @@ public class BookJob {
                     bookProps.getProperty("chapter.title.template"), 
                     chapterContent.getInfo().getChapterNumber(), 
                     bookProps);
-                epubBuilder.addChapter(chapterContent, chapterTitle);
+                int chapterNumber = chapterContent.getInfo().getChapterNumber();
+                java.util.Set<String> failedFilenames = failedFilenamesByChapter.getOrDefault(chapterNumber, new java.util.HashSet<>());
+                epubBuilder.addChapter(chapterContent, chapterTitle, failedFilenames);
             }
             
             // Save EPUB (use filename template for the file, title template is already used in EPUB)
@@ -817,6 +1028,31 @@ public class BookJob {
         
         // Cleanup
         cleanup(tmpImagesDir, tmpHtmlDir);
+        
+        // Report incomplete books if any
+        if (!incompleteBooks.isEmpty()) {
+            logger.warning("=== INCOMPLETE BOOKS REPORT ===");
+            logger.warning("Total incomplete books: " + incompleteBooks.size());
+            System.out.println("\n=== INCOMPLETE BOOKS REPORT ===");
+            System.out.println("Total incomplete books: " + incompleteBooks.size());
+            
+            for (IncompleteBook incomplete : incompleteBooks) {
+                logger.warning("Book " + incomplete.bookIndex + ": " + incomplete.bookFilename);
+                logger.warning("  Failed image URLs (" + incomplete.failedUrls.size() + "):");
+                System.out.println("\nBook " + incomplete.bookIndex + ": " + incomplete.bookFilename);
+                System.out.println("  Failed image URLs (" + incomplete.failedUrls.size() + "):");
+                for (String failedUrl : incomplete.failedUrls) {
+                    logger.warning("    - " + failedUrl);
+                    System.out.println("    - " + failedUrl);
+                }
+            }
+            
+            logger.warning("=== END INCOMPLETE BOOKS REPORT ===");
+            System.out.println("\n=== END INCOMPLETE BOOKS REPORT ===");
+        } else {
+            logger.info("Book was generated successfully with all images downloaded.");
+            System.out.println("Book was generated successfully with all images downloaded.");
+        }
     }
 
     /**
@@ -826,11 +1062,13 @@ public class BookJob {
         final int originalIndex;
         final Path imageFile;
         final boolean success;
+        final String imageUrl; // Store URL for failed downloads
         
-        ImageDownloadResult(int originalIndex, Path imageFile, boolean success) {
+        ImageDownloadResult(int originalIndex, Path imageFile, boolean success, String imageUrl) {
             this.originalIndex = originalIndex;
             this.imageFile = imageFile;
             this.success = success;
+            this.imageUrl = imageUrl;
         }
     }
     
@@ -862,7 +1100,10 @@ public class BookJob {
         
         @Override
         public ImageDownloadResult call() {
+            long taskStartTime = System.currentTimeMillis();
             try {
+                logger.finest("ImageDownloadTask[" + index + "] starting: " + imageUrl);
+                
                 // Generate filename (synchronized to avoid conflicts)
                 String filename;
                 synchronized (filenameCounters) {
@@ -870,55 +1111,101 @@ public class BookJob {
                 }
                 Path imageFile = chapterImagesDir.resolve(filename);
                 
+                logger.finest("ImageDownloadTask[" + index + "] generated filename: " + filename);
+                
                 // Print progress
                 System.out.println("  Downloading image " + (index + 1) + "/" + totalImages + 
                     " of chapter " + chapterNumber);
                 
                 // Check if file already exists (caching)
                 if (Files.exists(imageFile)) {
+                    logger.finest("ImageDownloadTask[" + index + "] file already exists, skipping download");
                     logger.info("Skipped existing image: " + filename + " from " + imageUrl);
-                    return new ImageDownloadResult(index, imageFile, true);
+                    return new ImageDownloadResult(index, imageFile, true, imageUrl);
                 }
                 
                 // Encode URL to handle spaces and special characters
                 String encodedImageUrl = encodeUrl(imageUrl);
+                logger.finest("ImageDownloadTask[" + index + "] encoded URL: " + encodedImageUrl);
                 
                 // Download image
+                logger.finest("ImageDownloadTask[" + index + "] calling downloadBinary()");
+                long downloadStartTime = System.currentTimeMillis();
                 byte[] imageData = httpClientService.downloadBinary(encodedImageUrl);
+                long downloadDuration = System.currentTimeMillis() - downloadStartTime;
+                
                 if (imageData == null) {
                     logger.warning("Failed to download image " + (index + 1) + "/" + totalImages + 
-                        " from " + imageUrl + " (encoded: " + encodedImageUrl + ")");
-                    return new ImageDownloadResult(index, null, false);
+                        " from " + imageUrl + " (encoded: " + encodedImageUrl + ") after " + downloadDuration + "ms");
+                    return new ImageDownloadResult(index, null, false, imageUrl);
                 }
+                
+                logger.finest("ImageDownloadTask[" + index + "] downloaded " + imageData.length + 
+                    " bytes in " + downloadDuration + "ms");
                 
                 // Write file (synchronized on filenameCounters to avoid conflicts)
                 // Note: Since filename generation is synchronized and we check file existence,
                 // this is mainly a safety measure for concurrent writes
+                long writeStartTime = System.currentTimeMillis();
                 synchronized (filenameCounters) {
                     // Double-check file doesn't exist (another thread might have created it)
                     if (!Files.exists(imageFile)) {
                         Files.write(imageFile, imageData);
+                        logger.finest("ImageDownloadTask[" + index + "] wrote file in " + 
+                            (System.currentTimeMillis() - writeStartTime) + "ms");
                     } else {
+                        logger.finest("ImageDownloadTask[" + index + "] file was created by another thread, skipping write");
                         logger.info("Skipped writing image (already exists): " + filename + " from " + imageUrl);
                     }
                 }
                 
-                logger.info("Downloaded image " + (index + 1) + "/" + totalImages + ": " + filename + " from " + imageUrl);
-                return new ImageDownloadResult(index, imageFile, true);
+                long totalDuration = System.currentTimeMillis() - taskStartTime;
+                logger.finest("ImageDownloadTask[" + index + "] completed successfully in " + totalDuration + "ms");
+                logger.info("Downloaded image " + (index + 1) + "/" + totalImages + ": " + filename + 
+                    " from " + imageUrl + " (duration: " + totalDuration + "ms)");
+                return new ImageDownloadResult(index, imageFile, true, imageUrl);
                 
             } catch (Exception e) {
-                logger.warning("Error downloading image " + imageUrl + ": " + e.getMessage());
-                return new ImageDownloadResult(index, null, false);
+                long totalDuration = System.currentTimeMillis() - taskStartTime;
+                logger.log(Level.WARNING, "Error downloading image " + imageUrl + " after " + totalDuration + "ms: " + e.getMessage(), e);
+                return new ImageDownloadResult(index, null, false, imageUrl);
             }
         }
     }
     
-    private List<Path> downloadImages(List<String> imageUrls, Path chapterImagesDir, int chapterNumber, 
+    /**
+     * Downloads images and returns both successful downloads and failed URLs/filenames.
+     * 
+     * @param imageUrls List of image URLs to download
+     * @param chapterImagesDir Directory to save images
+     * @param chapterNumber Chapter number
+     * @param currentChapterIndex Current chapter index
+     * @param totalChapters Total number of chapters
+     * @return A DownloadResult containing successful downloads and failed URLs/filenames
+     */
+    private static class DownloadResult {
+        final List<Path> downloadedImages;
+        final List<String> failedUrls;
+        final java.util.Map<String, String> failedUrlToFilename; // Map failed URL to expected filename
+        
+        DownloadResult(List<Path> downloadedImages, List<String> failedUrls, java.util.Map<String, String> failedUrlToFilename) {
+            this.downloadedImages = downloadedImages;
+            this.failedUrls = failedUrls;
+            this.failedUrlToFilename = failedUrlToFilename;
+        }
+    }
+    
+    private DownloadResult downloadImages(List<String> imageUrls, Path chapterImagesDir, int chapterNumber, 
             int currentChapterIndex, int totalChapters) {
         int totalImages = imageUrls.size();
         if (totalImages == 0) {
-            return new ArrayList<>();
+            logger.finest("downloadImages: No images to download for chapter " + chapterNumber);
+            return new DownloadResult(new ArrayList<>(), new ArrayList<>(), new java.util.HashMap<>());
         }
+        
+        logger.finest("downloadImages: Starting download of " + totalImages + " images for chapter " + 
+            chapterNumber + " using " + maxConcurrentImageDownloads + " concurrent downloads");
+        long downloadStartTime = System.currentTimeMillis();
         
         // Create thread pool for this chapter
         ExecutorService executor = Executors.newFixedThreadPool(maxConcurrentImageDownloads);
@@ -927,51 +1214,174 @@ public class BookJob {
         
         try {
             // Submit all download tasks
+            logger.finest("downloadImages: Submitting " + totalImages + " download tasks to thread pool");
             for (int i = 0; i < imageUrls.size(); i++) {
                 ImageDownloadTask task = new ImageDownloadTask(
                     i, imageUrls.get(i), chapterImagesDir, chapterNumber,
                     totalImages, currentChapterIndex, totalChapters, filenameCounters);
                 futures.add(executor.submit(task));
+                logger.finest("downloadImages: Submitted task " + (i + 1) + "/" + totalImages + " for URL: " + imageUrls.get(i));
             }
             
             // Wait for all tasks to complete and collect results
+            // Use timeout to prevent infinite blocking (60s per image)
+            long timeoutPerImage = 60; // seconds
             List<ImageDownloadResult> results = new ArrayList<>();
-            for (Future<ImageDownloadResult> future : futures) {
+            List<String> failedUrls = new ArrayList<>();
+            java.util.Map<String, String> failedUrlToFilename = new java.util.HashMap<>();
+            
+            for (int i = 0; i < futures.size(); i++) {
+                Future<ImageDownloadResult> future = futures.get(i);
+                String imageUrl = imageUrls.get(i);
+                boolean success = false;
+                
                 try {
-                    ImageDownloadResult result = future.get();
+                    logger.finest("Waiting for image download " + (i + 1) + "/" + totalImages + 
+                        " with timeout of " + timeoutPerImage + "s: " + imageUrl);
+                    long waitStartTime = System.currentTimeMillis();
+                    ImageDownloadResult result = future.get(timeoutPerImage, TimeUnit.SECONDS);
+                    long waitDuration = System.currentTimeMillis() - waitStartTime;
+                    logger.finest("Image download " + (i + 1) + "/" + totalImages + " completed after waiting " + 
+                        waitDuration + "ms");
                     results.add(result);
+                    if (result.success) {
+                        success = true;
+                    }
+                } catch (java.util.concurrent.TimeoutException e) {
+                    logger.severe("Image download " + (i + 1) + "/" + totalImages + 
+                        " timed out after " + timeoutPerImage + "s: " + imageUrl);
+                    logger.severe("This may indicate a network issue or the server is not responding");
+                    // Cancel the future to free resources
+                    future.cancel(true);
+                    // Generate expected filename for failed download
+                    String expectedFilename = generateImageFilename(imageUrl, i, filenameCounters);
+                    failedUrlToFilename.put(imageUrl, expectedFilename);
+                    results.add(new ImageDownloadResult(i, null, false, imageUrl));
                 } catch (ExecutionException e) {
-                    logger.severe("Image download task failed: " + e.getCause().getMessage());
+                    logger.severe("Image download task failed: " + e.getCause().getMessage() + " for URL: " + imageUrl);
+                    if (e.getCause() != null) {
+                        logger.log(Level.SEVERE, "Exception cause:", e.getCause());
+                    }
+                    // Generate expected filename for failed download
+                    String expectedFilename = generateImageFilename(imageUrl, i, filenameCounters);
+                    failedUrlToFilename.put(imageUrl, expectedFilename);
+                    results.add(new ImageDownloadResult(i, null, false, imageUrl));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     logger.severe("Interrupted while waiting for image downloads");
+                    // Cancel remaining futures
+                    for (Future<ImageDownloadResult> f : futures.subList(i, futures.size())) {
+                        f.cancel(true);
+                    }
                     break;
+                }
+                
+                // If download failed, wait 5 minutes and retry once
+                if (!success) {
+                    failedUrls.add(imageUrl);
+                    logger.warning("Image download failed, will retry after 5 minutes: " + imageUrl);
+                    System.err.println("WARNING: Image download failed for chapter " + chapterNumber + 
+                        ", waiting 5 minutes before retry: " + imageUrl);
+                    
+                    try {
+                        logger.info("Waiting 5 minutes before retrying failed image download...");
+                        System.err.println("Waiting 5 minutes before retrying failed image download...");
+                        Thread.sleep(5 * 60 * 1000); // 5 minutes
+                        
+                        // Retry the download
+                        logger.info("Retrying image download after 5 minute wait: " + imageUrl);
+                        System.err.println("Retrying image download: " + imageUrl);
+                        byte[] imageData = httpClientService.downloadBinary(encodeUrl(imageUrl));
+                        
+                        if (imageData != null) {
+                            // Generate filename
+                            String filename;
+                            synchronized (filenameCounters) {
+                                filename = generateImageFilename(imageUrl, i, filenameCounters);
+                            }
+                            Path imageFile = chapterImagesDir.resolve(filename);
+                            
+                            // Write file
+                            synchronized (filenameCounters) {
+                                if (!Files.exists(imageFile)) {
+                                    Files.write(imageFile, imageData);
+                                    logger.info("Successfully downloaded image on retry: " + filename + " from " + imageUrl);
+                                    System.err.println("SUCCESS: Image downloaded on retry: " + imageUrl);
+                                    // Update result
+                                    results.set(i, new ImageDownloadResult(i, imageFile, true, imageUrl));
+                                    failedUrls.remove(imageUrl);
+                                } else {
+                                    logger.info("Image file already exists on retry: " + filename);
+                                    results.set(i, new ImageDownloadResult(i, imageFile, true, imageUrl));
+                                    failedUrls.remove(imageUrl);
+                                }
+                            }
+                        } else {
+                            logger.severe("Retry also failed for image: " + imageUrl);
+                            System.err.println("ERROR: Retry also failed for image: " + imageUrl);
+                        }
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        logger.severe("Interrupted during 5-minute wait for retry");
+                        System.err.println("ERROR: Interrupted during 5-minute wait for retry");
+                    } catch (Exception retryException) {
+                        logger.severe("Exception during retry: " + retryException.getMessage());
+                        System.err.println("ERROR: Exception during retry: " + retryException.getMessage());
+                    }
                 }
             }
             
             // Sort results by original index to preserve order
             results.sort(Comparator.comparingInt(r -> r.originalIndex));
             
-            // Extract successfully downloaded images in order
+            // Extract successfully downloaded images in order and collect final failed URLs
             List<Path> downloadedImages = new ArrayList<>();
+            List<String> finalFailedUrls = new ArrayList<>();
+            int successCount = 0;
+            int failureCount = 0;
             for (ImageDownloadResult result : results) {
                 if (result.success && result.imageFile != null) {
                     downloadedImages.add(result.imageFile);
+                    successCount++;
+                } else {
+                    failureCount++;
+                    if (result.imageUrl != null) {
+                        finalFailedUrls.add(result.imageUrl);
+                    }
                 }
             }
             
-            return downloadedImages;
+            long totalDuration = System.currentTimeMillis() - downloadStartTime;
+            logger.finest("downloadImages: Completed chapter " + chapterNumber + 
+                " - Success: " + successCount + ", Failed: " + failureCount + 
+                ", Total time: " + totalDuration + "ms");
+            logger.info("Downloaded " + successCount + "/" + totalImages + " images for chapter " + 
+                chapterNumber + " in " + totalDuration + "ms");
+            
+            if (!finalFailedUrls.isEmpty()) {
+                logger.warning("Failed to download " + finalFailedUrls.size() + " images for chapter " + chapterNumber);
+                for (String failedUrl : finalFailedUrls) {
+                    logger.warning("  Failed URL: " + failedUrl);
+                }
+            }
+            
+            return new DownloadResult(downloadedImages, finalFailedUrls, failedUrlToFilename);
             
         } finally {
             // Shutdown executor
+            logger.finest("downloadImages: Shutting down executor for chapter " + chapterNumber);
             executor.shutdown();
             try {
                 if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+                    logger.warning("downloadImages: Executor did not terminate within 60s, forcing shutdown");
                     executor.shutdownNow();
+                } else {
+                    logger.finest("downloadImages: Executor terminated successfully");
                 }
             } catch (InterruptedException e) {
                 executor.shutdownNow();
                 Thread.currentThread().interrupt();
+                logger.warning("downloadImages: Interrupted while waiting for executor shutdown");
             }
         }
     }
@@ -1009,7 +1419,8 @@ public class BookJob {
         }
     }
 
-    private Path createChapterHtml(String chapterTitle, List<Path> imageFiles, int chapterNumber, Path tmpHtmlDir) throws IOException {
+    private Path createChapterHtml(String chapterTitle, List<Path> imageFiles, int chapterNumber, Path tmpHtmlDir,
+            java.util.Set<String> failedFilenames) throws IOException {
         StringBuilder html = new StringBuilder();
         html.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         html.append("<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.1//EN\" \"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd\">\n");
@@ -1018,11 +1429,43 @@ public class BookJob {
         html.append("<body>\n");
         html.append("<h1>").append(chapterTitle).append("</h1>\n");
         
+        // Collect all image filenames (downloaded + failed) to maintain order
+        java.util.Map<String, Path> imageFileMap = new java.util.HashMap<>();
         for (Path imageFile : imageFiles) {
-            String imageName = imageFile.getFileName().toString();
-            // Use subdirectory structure: images/10/1.jpg to match EPUB storage
-            html.append("<img src=\"images/").append(chapterNumber).append("/").append(imageName)
-                .append("\" style=\"width:100%;max-width:100%;\" />\n");
+            imageFileMap.put(imageFile.getFileName().toString(), imageFile);
+        }
+        
+        // Combine downloaded and failed filenames, sort by numeric value
+        java.util.Set<String> allFilenames = new java.util.HashSet<>();
+        allFilenames.addAll(imageFileMap.keySet());
+        if (failedFilenames != null) {
+            allFilenames.addAll(failedFilenames);
+        }
+        
+        java.util.List<String> sortedFilenames = new java.util.ArrayList<>(allFilenames);
+        sortedFilenames.sort((a, b) -> {
+            try {
+                int dotIndexA = a.lastIndexOf('.');
+                int dotIndexB = b.lastIndexOf('.');
+                String numPartA = dotIndexA > 0 ? a.substring(0, dotIndexA) : a;
+                String numPartB = dotIndexB > 0 ? b.substring(0, dotIndexB) : b;
+                return Integer.compare(Integer.parseInt(numPartA), Integer.parseInt(numPartB));
+            } catch (NumberFormatException e) {
+                return a.compareTo(b);
+            }
+        });
+        
+        // Add images and placeholders in order
+        for (String filename : sortedFilenames) {
+            if (imageFileMap.containsKey(filename)) {
+                // Successfully downloaded image
+                html.append("<img src=\"images/").append(chapterNumber).append("/").append(filename)
+                    .append("\" style=\"width:100%;max-width:100%;\" />\n");
+            } else if (failedFilenames != null && failedFilenames.contains(filename)) {
+                // Failed to download - add placeholder
+                html.append("<p style=\"text-align:center;color:#666;padding:20px;\">[Image could not be downloaded: ")
+                    .append(filename).append("]</p>\n");
+            }
         }
         
         html.append("</body>\n");
@@ -1113,6 +1556,38 @@ public class BookJob {
         }
         
         return sb.toString();
+    }
+    
+    /**
+     * Checks if a book file already exists for the given chapter range.
+     * 
+     * @param chapterStart The starting chapter number
+     * @param chapterEnd The ending chapter number
+     * @return true if the book file exists, false otherwise
+     */
+    private boolean bookFileExists(int chapterStart, int chapterEnd) {
+        // Create adjusted properties for this book's chapter range
+        Properties adjustedProps = new Properties(bookProps);
+        adjustedProps.setProperty("chapter.start", String.valueOf(chapterStart));
+        adjustedProps.setProperty("chapter.end", String.valueOf(chapterEnd));
+        
+        // Generate filename for saving (using book.filename.template, fallback to book.title.template)
+        String filenameTemplate = bookProps.getProperty("book.filename.template");
+        if (filenameTemplate == null || filenameTemplate.isEmpty()) {
+            filenameTemplate = bookProps.getProperty("book.title.template", "");
+        }
+        String bookFilename = TemplateEngine.applyBookTitleTemplate(filenameTemplate, adjustedProps);
+        
+        // Sanitize filename
+        String sanitizedFilename = LoggerFactory.sanitizeFilename(bookFilename);
+        
+        // Add extension based on output format
+        String extension = outputFormat.equals("pdf") ? ".pdf" : ".epub";
+        String fullFilename = sanitizedFilename + extension;
+        
+        // Check if file exists
+        Path bookFile = outputDir.resolve(fullFilename);
+        return Files.exists(bookFile);
     }
     
     private void cleanup(Path tmpImagesDir, Path tmpHtmlDir) {

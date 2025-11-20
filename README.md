@@ -14,6 +14,14 @@ mvn clean package
 **Run the application:**
 ```bash
 java -jar target/web2book-1.0.0.jar
+
+
+## TO DO
+
+Done. Generate books as soon as their chapters are ready
+Done.Add a parameter: �Overwrite regenerate existing books: true/false�. If false, skip the book
+Done. Separate the output for temp file from the output for books
+
 ```
 
 > **Note:** Ensure `web2book.properties` exists in the current working directory before running.
@@ -210,4 +218,5 @@ Web2Book/
 ## License
 
 This project is provided as-is for personal use.
+
 
