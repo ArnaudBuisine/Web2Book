@@ -20,6 +20,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -39,6 +40,7 @@ public class BookJob {
     private String outputFormat;
     private Logger logger;
     private String bookTitle;
+    private int maxConcurrentImageDownloads;
 
     public BookJob(Path bookConfigPath, Properties globalProps, HttpClientService httpClientService) {
         this.bookConfigPath = bookConfigPath;
@@ -292,6 +294,56 @@ public class BookJob {
                 logDir = outputDir;
             }
         }
+        
+        // Resolve max concurrent image downloads
+        String bookMaxConcurrent = bookProps.getProperty("max.concurrent.image.downloads");
+        if (bookMaxConcurrent != null && !bookMaxConcurrent.trim().isEmpty()) {
+            try {
+                int value = Integer.parseInt(bookMaxConcurrent.trim());
+                if (value > 0) {
+                    maxConcurrentImageDownloads = value;
+                } else {
+                    // Invalid value, use global or default
+                    String globalMaxConcurrent = globalProps.getProperty("max.concurrent.image.downloads");
+                    if (globalMaxConcurrent != null && !globalMaxConcurrent.trim().isEmpty()) {
+                        try {
+                            int globalValue = Integer.parseInt(globalMaxConcurrent.trim());
+                            maxConcurrentImageDownloads = (globalValue > 0) ? globalValue : 4;
+                        } catch (NumberFormatException e) {
+                            maxConcurrentImageDownloads = 4;
+                        }
+                    } else {
+                        maxConcurrentImageDownloads = 4;
+                    }
+                }
+            } catch (NumberFormatException e) {
+                // Invalid value, use global or default
+                String globalMaxConcurrent = globalProps.getProperty("max.concurrent.image.downloads");
+                if (globalMaxConcurrent != null && !globalMaxConcurrent.trim().isEmpty()) {
+                    try {
+                        int globalValue = Integer.parseInt(globalMaxConcurrent.trim());
+                        maxConcurrentImageDownloads = (globalValue > 0) ? globalValue : 4;
+                    } catch (NumberFormatException ex) {
+                        maxConcurrentImageDownloads = 4;
+                    }
+                } else {
+                    maxConcurrentImageDownloads = 4;
+                }
+            }
+        } else {
+            // Book-specific not set, use global or default
+            String globalMaxConcurrent = globalProps.getProperty("max.concurrent.image.downloads");
+            if (globalMaxConcurrent != null && !globalMaxConcurrent.trim().isEmpty()) {
+                try {
+                    int globalValue = Integer.parseInt(globalMaxConcurrent.trim());
+                    maxConcurrentImageDownloads = (globalValue > 0) ? globalValue : 4;
+                } catch (NumberFormatException e) {
+                    maxConcurrentImageDownloads = 4;
+                }
+            } else {
+                maxConcurrentImageDownloads = 4;
+            }
+        }
     }
 
     private void processVolumes(List<ChapterInfo> chapters, int maxChaptersPerBook) {
@@ -312,10 +364,16 @@ public class BookJob {
             return;
         }
         
+        // Track total processing time
+        long totalStartTime = System.currentTimeMillis();
+        
         // Process each chapter sequentially
         int totalChapters = chapters.size();
         int processedCount = 0;
         for (ChapterInfo chapterInfo : chapters) {
+            // Track chapter processing time
+            long chapterStartTime = System.currentTimeMillis();
+            
             try {
                 processedCount++;
                 int percentage = (int) Math.round((processedCount * 100.0) / totalChapters);
@@ -369,7 +427,15 @@ public class BookJob {
                     processedCount, totalChapters);
                 
                 if (downloadedImages.isEmpty()) {
-                    logger.warning("No images downloaded for chapter " + chapterInfo.getChapterNumber() + ". Skipping.");
+                    logger.warning("Chapter " + chapterInfo.getChapterNumber() + 
+                        " has no successfully downloaded images, skipping this chapter.");
+                    // Still apply thinking time before next chapter
+                    if (chapters.indexOf(chapterInfo) < chapters.size() - 1) {
+                        long jitter = 500 + random.nextInt(1001); // 500-1500 ms
+                        long totalWait = thinkingTimeMs + jitter;
+                        logger.info("Waiting " + totalWait + " ms before next chapter");
+                        Thread.sleep(totalWait);
+                    }
                     continue;
                 }
                 
@@ -385,9 +451,12 @@ public class BookJob {
                 ChapterContent chapterContent = new ChapterContent(chapterInfo, downloadedImages, chapterHtmlFile);
                 allSuccessfullyProcessed.add(chapterContent);
                 
-                logger.info("Completed chapter " + chapterInfo.getChapterNumber());
+                // Calculate and log chapter duration
+                long chapterDuration = System.currentTimeMillis() - chapterStartTime;
+                String durationStr = formatDuration(chapterDuration);
+                logger.info("Completed chapter " + chapterInfo.getChapterNumber() + " (duration: " + durationStr + ")");
                 
-                // Thinking time with random jitter
+                // Thinking time with random jitter (AFTER all images are downloaded, BEFORE next chapter)
                 if (chapters.indexOf(chapterInfo) < chapters.size() - 1) {
                     long jitter = 500 + random.nextInt(1001); // 500-1500 ms
                     long totalWait = thinkingTimeMs + jitter;
@@ -407,6 +476,11 @@ public class BookJob {
                 System.err.println("ERROR: " + errorMsg);
             }
         }
+        
+        // Log total processing duration
+        long totalDuration = System.currentTimeMillis() - totalStartTime;
+        String totalDurationStr = formatDuration(totalDuration);
+        logger.info("Total processing duration: " + totalDurationStr);
         
         // Check if we have any successfully processed chapters
         if (allSuccessfullyProcessed.isEmpty()) {
@@ -536,10 +610,16 @@ public class BookJob {
         List<ChapterContent> successfullyProcessedChapters = new ArrayList<>();
         Random random = new Random();
         
+        // Track total processing time
+        long totalStartTime = System.currentTimeMillis();
+        
         // Process each chapter sequentially
         int totalChapters = chapters.size();
         int processedCount = 0;
         for (ChapterInfo chapterInfo : chapters) {
+            // Track chapter processing time
+            long chapterStartTime = System.currentTimeMillis();
+            
             try {
                 processedCount++;
                 int percentage = (int) Math.round((processedCount * 100.0) / totalChapters);
@@ -593,7 +673,15 @@ public class BookJob {
                     processedCount, totalChapters);
                 
                 if (downloadedImages.isEmpty()) {
-                    logger.warning("No images downloaded for chapter " + chapterInfo.getChapterNumber() + ". Skipping.");
+                    logger.warning("Chapter " + chapterInfo.getChapterNumber() + 
+                        " has no successfully downloaded images, skipping this chapter.");
+                    // Still apply thinking time before next chapter
+                    if (chapters.indexOf(chapterInfo) < chapters.size() - 1) {
+                        long jitter = 500 + random.nextInt(1001); // 500-1500 ms
+                        long totalWait = thinkingTimeMs + jitter;
+                        logger.info("Waiting " + totalWait + " ms before next chapter");
+                        Thread.sleep(totalWait);
+                    }
                     continue;
                 }
                 
@@ -609,9 +697,12 @@ public class BookJob {
                 ChapterContent chapterContent = new ChapterContent(chapterInfo, downloadedImages, chapterHtmlFile);
                 successfullyProcessedChapters.add(chapterContent);
                 
-                logger.info("Completed chapter " + chapterInfo.getChapterNumber());
+                // Calculate and log chapter duration
+                long chapterDuration = System.currentTimeMillis() - chapterStartTime;
+                String durationStr = formatDuration(chapterDuration);
+                logger.info("Completed chapter " + chapterInfo.getChapterNumber() + " (duration: " + durationStr + ")");
                 
-                // Thinking time with random jitter
+                // Thinking time with random jitter (AFTER all images are downloaded, BEFORE next chapter)
                 if (chapters.indexOf(chapterInfo) < chapters.size() - 1) {
                     long jitter = 500 + random.nextInt(1001); // 500-1500 ms
                     long totalWait = thinkingTimeMs + jitter;
@@ -631,6 +722,11 @@ public class BookJob {
                 System.err.println("ERROR: " + errorMsg);
             }
         }
+        
+        // Log total processing duration
+        long totalDuration = System.currentTimeMillis() - totalStartTime;
+        String totalDurationStr = formatDuration(totalDuration);
+        logger.info("Total processing duration: " + totalDurationStr);
         
         // Check if we have any successfully processed chapters
         if (successfullyProcessedChapters.isEmpty()) {
@@ -723,28 +819,66 @@ public class BookJob {
         cleanup(tmpImagesDir, tmpHtmlDir);
     }
 
-    private List<Path> downloadImages(List<String> imageUrls, Path chapterImagesDir, int chapterNumber, 
-            int currentChapterIndex, int totalChapters) {
-        List<Path> downloadedImages = new ArrayList<>();
-        Map<String, Integer> filenameCounters = new HashMap<>();
-        int totalImages = imageUrls.size();
+    /**
+     * Result of an image download task, preserving the original index for ordering.
+     */
+    private static class ImageDownloadResult {
+        final int originalIndex;
+        final Path imageFile;
+        final boolean success;
         
-        for (int i = 0; i < imageUrls.size(); i++) {
-            String imageUrl = imageUrls.get(i);
+        ImageDownloadResult(int originalIndex, Path imageFile, boolean success) {
+            this.originalIndex = originalIndex;
+            this.imageFile = imageFile;
+            this.success = success;
+        }
+    }
+    
+    /**
+     * Task for downloading a single image with caching and error handling.
+     */
+    private class ImageDownloadTask implements Callable<ImageDownloadResult> {
+        private final int index;
+        private final String imageUrl;
+        private final Path chapterImagesDir;
+        private final int chapterNumber;
+        private final int totalImages;
+        private final int currentChapterIndex;
+        private final int totalChapters;
+        private final Map<String, Integer> filenameCounters;
+        
+        ImageDownloadTask(int index, String imageUrl, Path chapterImagesDir, int chapterNumber,
+                         int totalImages, int currentChapterIndex, int totalChapters,
+                         Map<String, Integer> filenameCounters) {
+            this.index = index;
+            this.imageUrl = imageUrl;
+            this.chapterImagesDir = chapterImagesDir;
+            this.chapterNumber = chapterNumber;
+            this.totalImages = totalImages;
+            this.currentChapterIndex = currentChapterIndex;
+            this.totalChapters = totalChapters;
+            this.filenameCounters = filenameCounters;
+        }
+        
+        @Override
+        public ImageDownloadResult call() {
             try {
-                // Generate filename
-                String filename = generateImageFilename(imageUrl, i, filenameCounters);
+                // Generate filename (synchronized to avoid conflicts)
+                String filename;
+                synchronized (filenameCounters) {
+                    filename = generateImageFilename(imageUrl, index, filenameCounters);
+                }
                 Path imageFile = chapterImagesDir.resolve(filename);
-                System.out.println("Processing Image " + (i + 1) + "/" + totalImages + " of chapter " + chapterNumber);
                 
+                // Print progress
+                System.out.println("  Downloading image " + (index + 1) + "/" + totalImages + 
+                    " of chapter " + chapterNumber);
                 
                 // Check if file already exists (caching)
                 if (Files.exists(imageFile)) {
                     logger.info("Skipped existing image: " + filename + " from " + imageUrl);
-                    downloadedImages.add(imageFile);
-                    continue;
+                    return new ImageDownloadResult(index, imageFile, true);
                 }
-
                 
                 // Encode URL to handle spaces and special characters
                 String encodedImageUrl = encodeUrl(imageUrl);
@@ -752,38 +886,94 @@ public class BookJob {
                 // Download image
                 byte[] imageData = httpClientService.downloadBinary(encodedImageUrl);
                 if (imageData == null) {
-                    logger.warning("Failed to download image " + (i + 1) + "/" + imageUrls.size() + 
+                    logger.warning("Failed to download image " + (index + 1) + "/" + totalImages + 
                         " from " + imageUrl + " (encoded: " + encodedImageUrl + ")");
-                    continue;
+                    return new ImageDownloadResult(index, null, false);
                 }
                 
-                Files.write(imageFile, imageData);
-                downloadedImages.add(imageFile);
-                logger.info("Downloaded image " + (i + 1) + "/" + imageUrls.size() + ": " + filename + " from " + imageUrl);
+                // Write file (synchronized on filenameCounters to avoid conflicts)
+                // Note: Since filename generation is synchronized and we check file existence,
+                // this is mainly a safety measure for concurrent writes
+                synchronized (filenameCounters) {
+                    // Double-check file doesn't exist (another thread might have created it)
+                    if (!Files.exists(imageFile)) {
+                        Files.write(imageFile, imageData);
+                    } else {
+                        logger.info("Skipped writing image (already exists): " + filename + " from " + imageUrl);
+                    }
+                }
+                
+                logger.info("Downloaded image " + (index + 1) + "/" + totalImages + ": " + filename + " from " + imageUrl);
+                return new ImageDownloadResult(index, imageFile, true);
                 
             } catch (Exception e) {
                 logger.warning("Error downloading image " + imageUrl + ": " + e.getMessage());
+                return new ImageDownloadResult(index, null, false);
             }
         }
+    }
+    
+    private List<Path> downloadImages(List<String> imageUrls, Path chapterImagesDir, int chapterNumber, 
+            int currentChapterIndex, int totalChapters) {
+        int totalImages = imageUrls.size();
+        if (totalImages == 0) {
+            return new ArrayList<>();
+        }
         
-        // Sort images by numeric value in filename (e.g., "1.jpg", "2.jpg", "10.jpg")
-        // This ensures proper ordering even if files were created out of order
-        downloadedImages.sort(Comparator.comparing(p -> {
-            String name = p.getFileName().toString();
-            try {
-                // Extract number from filename (e.g., "1.jpg" -> 1, "10.jpg" -> 10)
-                int dotIndex = name.lastIndexOf('.');
-                if (dotIndex > 0) {
-                    String numberPart = name.substring(0, dotIndex);
-                    return Integer.parseInt(numberPart);
-                }
-            } catch (NumberFormatException e) {
-                // If not a number, use 0 (will be sorted first)
+        // Create thread pool for this chapter
+        ExecutorService executor = Executors.newFixedThreadPool(maxConcurrentImageDownloads);
+        List<Future<ImageDownloadResult>> futures = new ArrayList<>();
+        Map<String, Integer> filenameCounters = new ConcurrentHashMap<>();
+        
+        try {
+            // Submit all download tasks
+            for (int i = 0; i < imageUrls.size(); i++) {
+                ImageDownloadTask task = new ImageDownloadTask(
+                    i, imageUrls.get(i), chapterImagesDir, chapterNumber,
+                    totalImages, currentChapterIndex, totalChapters, filenameCounters);
+                futures.add(executor.submit(task));
             }
-            return 0;
-        }));
-        
-        return downloadedImages;
+            
+            // Wait for all tasks to complete and collect results
+            List<ImageDownloadResult> results = new ArrayList<>();
+            for (Future<ImageDownloadResult> future : futures) {
+                try {
+                    ImageDownloadResult result = future.get();
+                    results.add(result);
+                } catch (ExecutionException e) {
+                    logger.severe("Image download task failed: " + e.getCause().getMessage());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    logger.severe("Interrupted while waiting for image downloads");
+                    break;
+                }
+            }
+            
+            // Sort results by original index to preserve order
+            results.sort(Comparator.comparingInt(r -> r.originalIndex));
+            
+            // Extract successfully downloaded images in order
+            List<Path> downloadedImages = new ArrayList<>();
+            for (ImageDownloadResult result : results) {
+                if (result.success && result.imageFile != null) {
+                    downloadedImages.add(result.imageFile);
+                }
+            }
+            
+            return downloadedImages;
+            
+        } finally {
+            // Shutdown executor
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     private String generateImageFilename(String imageUrl, int index, Map<String, Integer> filenameCounters) {
@@ -873,6 +1063,58 @@ public class BookJob {
         }
     }
 
+    /**
+     * Formats a duration in milliseconds to a human-readable string.
+     * Only displays non-zero units (hours, minutes, seconds, milliseconds).
+     * 
+     * @param durationMs Duration in milliseconds
+     * @return Formatted string (e.g., "1h 23m 45s 123ms" or "45s 123ms" or "123ms")
+     */
+    private String formatDuration(long durationMs) {
+        if (durationMs < 0) {
+            return "0ms";
+        }
+        
+        long totalMs = durationMs;
+        long hours = totalMs / 3_600_000;
+        long minutes = (totalMs % 3_600_000) / 60_000;
+        long seconds = (totalMs % 60_000) / 1_000;
+        long milliseconds = totalMs % 1_000;
+        
+        StringBuilder sb = new StringBuilder();
+        
+        if (hours > 0) {
+            sb.append(hours).append("h");
+            if (minutes > 0 || seconds > 0 || milliseconds > 0) {
+                sb.append(" ");
+            }
+        }
+        
+        if (hours > 0 || minutes > 0) {
+            if (minutes > 0) {
+                sb.append(minutes).append("m");
+                if (seconds > 0 || milliseconds > 0) {
+                    sb.append(" ");
+                }
+            }
+        }
+        
+        if (hours > 0 || minutes > 0 || seconds > 0) {
+            if (seconds > 0) {
+                sb.append(seconds).append("s");
+                if (milliseconds > 0) {
+                    sb.append(" ");
+                }
+            }
+        }
+        
+        if (milliseconds > 0 || sb.length() == 0) {
+            sb.append(milliseconds).append("ms");
+        }
+        
+        return sb.toString();
+    }
+    
     private void cleanup(Path tmpImagesDir, Path tmpHtmlDir) {
         // Delete HTML folder if configured
         String deleteXhtml = bookProps.getProperty("delete.xhtml.after.generation", "false");
