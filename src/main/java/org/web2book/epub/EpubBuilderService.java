@@ -2,6 +2,7 @@
 // Date: 2025-01-27
 package org.web2book.epub;
 
+import nl.siegmann.epublib.domain.Author;
 import nl.siegmann.epublib.domain.Book;
 import nl.siegmann.epublib.domain.Metadata;
 import nl.siegmann.epublib.domain.Resource;
@@ -22,16 +23,29 @@ public class EpubBuilderService {
     private final Book book;
     private final String bookTitle;
     private final Logger logger;
+    private final java.util.Properties bookProps;
 
-    public EpubBuilderService(String bookTitle, Logger logger) {
+    public EpubBuilderService(String bookTitle, Logger logger, java.util.Properties bookProps) {
         this.bookTitle = bookTitle;
         this.logger = logger;
+        this.bookProps = bookProps;
         this.book = new Book();
         
         // Set metadata
         Metadata metadata = book.getMetadata();
         metadata.addTitle(bookTitle);
-        // No author as per specification
+        
+        // Add author if available
+        if (bookProps != null) {
+            String authorName = bookProps.getProperty("book.author", "");
+            if (!authorName.isEmpty()) {
+                Author author = new Author(authorName);
+                metadata.addAuthor(author);
+                logger.info("Added author to EPUB metadata: " + authorName);
+            } else {
+                logger.info("No author specified in book.author property");
+            }
+        }
     }
 
     /**

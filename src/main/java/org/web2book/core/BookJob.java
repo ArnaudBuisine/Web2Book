@@ -493,7 +493,7 @@ public class BookJob {
                 }
             } else {
                 // EPUB format
-                EpubBuilderService epubBuilder = new EpubBuilderService(volumeTitle, logger);
+                EpubBuilderService epubBuilder = new EpubBuilderService(volumeTitle, logger, adjustedProps);
                 for (ChapterContent chapterContent : volumeChapters) {
                     String chapterTitle = TemplateEngine.applyChapterTitleTemplate(
                         bookProps.getProperty("chapter.title.template"), 
@@ -699,7 +699,7 @@ public class BookJob {
             }
         } else {
             // EPUB format
-            EpubBuilderService epubBuilder = new EpubBuilderService(adjustedTitle, logger);
+            EpubBuilderService epubBuilder = new EpubBuilderService(adjustedTitle, logger, adjustedProps);
             for (ChapterContent chapterContent : successfullyProcessedChapters) {
                 String chapterTitle = TemplateEngine.applyChapterTitleTemplate(
                     bookProps.getProperty("chapter.title.template"), 

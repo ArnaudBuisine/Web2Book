@@ -315,6 +315,28 @@ public class PdfBuilderService {
                     logger.severe("Cannot draw book title - font unavailable");
                 }
                 
+                // Author name (if available)
+                if (bookProps != null) {
+                    String author = bookProps.getProperty("book.author", "");
+                    if (!author.isEmpty() && regularFont != null) {
+                        try {
+                            y -= 30f; // Space before author
+                            contentStream.setNonStrokingColor(0, 0, 0);
+                            contentStream.beginText();
+                            contentStream.setFont(regularFont, 14f); // Author font size
+                            float authorWidth = regularFont.getStringWidth(author) / 1000f * 14f;
+                            float authorX = (pageWidth - authorWidth) / 2f;
+                            contentStream.newLineAtOffset(authorX, y);
+                            contentStream.showText(author);
+                            contentStream.endText();
+                            y -= 40f; // Space after author
+                        } catch (Exception e) {
+                            logger.warning("Failed to draw author name: " + e.getMessage());
+                            e.printStackTrace();
+                        }
+                    }
+                }
+                
                 // Table of Contents heading
                 if (titleFont != null && !chapterTitles.isEmpty()) {
                     try {
@@ -322,7 +344,7 @@ public class PdfBuilderService {
                         // Set text color to black
                         contentStream.setNonStrokingColor(0, 0, 0);
                         // Reduced font size for TOC heading
-                        float tocHeadingFontSize = 14f; // Reduced from 18f
+                        float tocHeadingFontSize = 12f; // Reduced from 18f
                         contentStream.beginText();
                         contentStream.setFont(titleFont, tocHeadingFontSize);
                         float tocWidth = titleFont.getStringWidth("Table of Contents") / 1000f * tocHeadingFontSize;
@@ -332,14 +354,10 @@ public class PdfBuilderService {
                         contentStream.endText();
                         y -= 50f;
                         
-                        // Store the left edge of the centered TOC title for aligning content
-                        // This will be used to align TOC entries to the TOC title
-                        tocContentStartX = tocX;
-                        
                         // Chapter list (links will be added after chapters are created)
+                        // TOC entries will be centered on the page
                         if (regularFont != null) {
                             float lineHeight = 16f; // Reduced line height for smaller font
-                            float textStartX = tocContentStartX; // Align to TOC title's left edge
                             float tocFontSize = 9f; // Reduced font size for TOC
                             
                             for (int i = 0; i < chapterTitles.size(); i++) {
@@ -349,12 +367,20 @@ public class PdfBuilderService {
                                 try {
                                     // Set text color to black
                                     contentStream.setNonStrokingColor(0, 0, 0);
-                                    // Draw text
+                                    // Draw text - center each entry on the page
                                     contentStream.beginText();
                                     contentStream.setFont(regularFont, tocFontSize);
-                                    contentStream.newLineAtOffset(textStartX, y);
+                                    // Calculate width of this entry and center it
+                                    float entryWidth = regularFont.getStringWidth(tocEntry) / 1000f * tocFontSize;
+                                    float entryX = (pageWidth - entryWidth) / 2f;
+                                    contentStream.newLineAtOffset(entryX, y);
                                     contentStream.showText(tocEntry);
                                     contentStream.endText();
+                                    
+                                    // Store the left edge of the first entry for link positioning
+                                    if (i == 0) {
+                                        tocContentStartX = entryX;
+                                    }
                                 } catch (Exception e) {
                                     logger.warning("Failed to draw TOC entry " + (i + 1) + ": " + e.getMessage());
                                     e.printStackTrace();
@@ -400,10 +426,25 @@ public class PdfBuilderService {
             float pageHeight = PDRectangle.A4.getHeight();
             float margin = 50f;
             float lineHeight = 16f; // Match the reduced line height used in addTitlePage
-            // Use the same X position as TOC content (aligned to TOC title)
-            float textStartX = tocContentStartX;
             float pageWidth = PDRectangle.A4.getWidth();
-            float textWidth = pageWidth - tocContentStartX - margin; // Width from TOC start to right margin
+            // Calculate the width of TOC entries (use longest entry as reference)
+            // TOC entries are centered, so we need to calculate the width based on the longest entry
+            float maxEntryWidth = 0f;
+            PDType1Font regularFont = getRegularFont();
+            if (regularFont != null) {
+                float tocFontSize = 9f;
+                for (int i = 0; i < chapters.size(); i++) {
+                    ChapterInfo chapter = chapters.get(i);
+                    String entry = (i + 1) + ". " + chapter.title;
+                    float entryWidth = regularFont.getStringWidth(entry) / 1000f * tocFontSize;
+                    if (entryWidth > maxEntryWidth) {
+                        maxEntryWidth = entryWidth;
+                    }
+                }
+            }
+            // Center the link rectangles on the page
+            float textStartX = (pageWidth - maxEntryWidth) / 2f;
+            float textWidth = maxEntryWidth;
             
             // Calculate starting Y position for TOC entries
             // Account for two-line title (manga name + chapter range) and TOC heading
