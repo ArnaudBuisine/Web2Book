@@ -11,6 +11,9 @@ import org.web2book.model.ChapterInfo;
 import org.web2book.net.HttpClientService;
 import org.web2book.util.TemplateEngine;
 
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.net.URL;
@@ -25,6 +28,12 @@ import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
+import javax.imageio.ImageIO;
+import javax.imageio.ImageReader;
+import javax.imageio.ImageWriteParam;
+import javax.imageio.ImageWriter;
+import javax.imageio.stream.ImageInputStream;
+import javax.imageio.stream.ImageOutputStream;
 
 /**
  * Handles the processing of a single book configuration.
@@ -97,7 +106,7 @@ public class BookJob {
             
             // Initialize logger
             String loggerName = "web2book." + LoggerFactory.sanitizeFilename(bookTitle);
-            logger = LoggerFactory.createFileLogger(loggerName, logDir, bookTitle);
+            logger = LoggerFactory.createFileLogger(loggerName, logDir, bookTitle, globalProps);
             
             logger.info("Starting book processing: " + bookTitle);
             logger.info("Config file: " + bookConfigPath.toAbsolutePath());
@@ -1143,27 +1152,32 @@ public class BookJob {
                 logger.finest("ImageDownloadTask[" + index + "] downloaded " + imageData.length + 
                     " bytes in " + downloadDuration + "ms");
                 
+                // Convert WebP to JPEG if necessary
+                byte[] processedImageData = convertWebPToJpeg(imageData);
+                String finalFilename = updateFilenameForJpeg(filename);
+                Path finalImageFile = chapterImagesDir.resolve(finalFilename);
+                
                 // Write file (synchronized on filenameCounters to avoid conflicts)
                 // Note: Since filename generation is synchronized and we check file existence,
                 // this is mainly a safety measure for concurrent writes
                 long writeStartTime = System.currentTimeMillis();
                 synchronized (filenameCounters) {
                     // Double-check file doesn't exist (another thread might have created it)
-                    if (!Files.exists(imageFile)) {
-                        Files.write(imageFile, imageData);
+                    if (!Files.exists(finalImageFile)) {
+                        Files.write(finalImageFile, processedImageData);
                         logger.finest("ImageDownloadTask[" + index + "] wrote file in " + 
                             (System.currentTimeMillis() - writeStartTime) + "ms");
                     } else {
                         logger.finest("ImageDownloadTask[" + index + "] file was created by another thread, skipping write");
-                        logger.info("Skipped writing image (already exists): " + filename + " from " + imageUrl);
+                        logger.info("Skipped writing image (already exists): " + finalFilename + " from " + imageUrl);
                     }
                 }
                 
                 long totalDuration = System.currentTimeMillis() - taskStartTime;
                 logger.finest("ImageDownloadTask[" + index + "] completed successfully in " + totalDuration + "ms");
-                logger.info("Downloaded image " + (index + 1) + "/" + totalImages + ": " + filename + 
+                logger.info("Downloaded image " + (index + 1) + "/" + totalImages + ": " + finalFilename + 
                     " from " + imageUrl + " (duration: " + totalDuration + "ms)");
-                return new ImageDownloadResult(index, imageFile, true, imageUrl);
+                return new ImageDownloadResult(index, finalImageFile, true, imageUrl);
                 
             } catch (Exception e) {
                 long totalDuration = System.currentTimeMillis() - taskStartTime;
@@ -1294,24 +1308,28 @@ public class BookJob {
                         byte[] imageData = httpClientService.downloadBinary(encodeUrl(imageUrl));
                         
                         if (imageData != null) {
+                            // Convert WebP to JPEG if necessary
+                            byte[] processedImageData = convertWebPToJpeg(imageData);
+                            
                             // Generate filename
                             String filename;
                             synchronized (filenameCounters) {
                                 filename = generateImageFilename(imageUrl, i, filenameCounters);
                             }
-                            Path imageFile = chapterImagesDir.resolve(filename);
+                            String finalFilename = updateFilenameForJpeg(filename);
+                            Path imageFile = chapterImagesDir.resolve(finalFilename);
                             
                             // Write file
                             synchronized (filenameCounters) {
                                 if (!Files.exists(imageFile)) {
-                                    Files.write(imageFile, imageData);
-                                    logger.info("Successfully downloaded image on retry: " + filename + " from " + imageUrl);
+                                    Files.write(imageFile, processedImageData);
+                                    logger.info("Successfully downloaded image on retry: " + finalFilename + " from " + imageUrl);
                                     System.err.println("SUCCESS: Image downloaded on retry: " + imageUrl);
                                     // Update result
                                     results.set(i, new ImageDownloadResult(i, imageFile, true, imageUrl));
                                     failedUrls.remove(imageUrl);
                                 } else {
-                                    logger.info("Image file already exists on retry: " + filename);
+                                    logger.info("Image file already exists on retry: " + finalFilename);
                                     results.set(i, new ImageDownloadResult(i, imageFile, true, imageUrl));
                                     failedUrls.remove(imageUrl);
                                 }
@@ -1790,6 +1808,93 @@ public class BookJob {
             logger.warning("Failed to encode URL " + url + ": " + e.getMessage() + ". Using simple encoding.");
             return url.replace(" ", "%20");
         }
+    }
+
+    /**
+     * Converts WebP image data to JPEG format.
+     * Uses TwelveMonkeys ImageIO library for WebP support.
+     * 
+     * @param imageData The original image data (may be WebP or other format)
+     * @return Converted JPEG image data, or original data if not WebP or conversion fails
+     */
+    private byte[] convertWebPToJpeg(byte[] imageData) {
+        if (imageData == null || imageData.length < 12) {
+            return imageData;
+        }
+        
+        // Check if it's a WebP image (RIFF header: "RIFF" at offset 0, "WEBP" at offset 8)
+        boolean isWebP = imageData.length >= 12 &&
+            imageData[0] == 'R' && imageData[1] == 'I' && imageData[2] == 'F' && imageData[3] == 'F' &&
+            imageData[8] == 'W' && imageData[9] == 'E' && imageData[10] == 'B' && imageData[11] == 'P';
+        
+        if (!isWebP) {
+            return imageData; // Not WebP, return original
+        }
+        
+        try {
+            logger.finest("Converting WebP image to JPEG");
+            
+            // Read WebP image using ImageIO (TwelveMonkeys library provides WebP support)
+            ByteArrayInputStream bais = new ByteArrayInputStream(imageData);
+            BufferedImage image = ImageIO.read(bais);
+            
+            if (image == null) {
+                logger.warning("Failed to read WebP image, returning original data");
+                return imageData;
+            }
+            
+            // Convert to JPEG with quality settings
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            
+            // Get JPEG writer
+            ImageWriter writer = ImageIO.getImageWritersByFormatName("jpg").next();
+            if (writer != null) {
+                ImageWriteParam param = writer.getDefaultWriteParam();
+                if (param.canWriteCompressed()) {
+                    param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+                    param.setCompressionQuality(0.9f); // High quality JPEG
+                }
+                
+                ImageOutputStream ios = ImageIO.createImageOutputStream(baos);
+                writer.setOutput(ios);
+                writer.write(null, new javax.imageio.IIOImage(image, null, null), param);
+                writer.dispose();
+                ios.close();
+            } else {
+                // Fallback to simple ImageIO.write
+                ImageIO.write(image, "jpg", baos);
+            }
+            
+            byte[] jpegData = baos.toByteArray();
+            
+            logger.info("Successfully converted WebP image to JPEG (" + imageData.length + 
+                " bytes -> " + jpegData.length + " bytes)");
+            
+            return jpegData;
+        } catch (Exception e) {
+            logger.warning("Failed to convert WebP to JPEG: " + e.getMessage() + ", using original format");
+            logger.log(Level.FINEST, "WebP conversion error details", e);
+            return imageData; // Return original on failure
+        }
+    }
+
+    /**
+     * Updates filename extension to .jpg if it was .webp
+     * 
+     * @param filename Original filename
+     * @return Filename with .jpg extension if original was .webp, otherwise unchanged
+     */
+    private String updateFilenameForJpeg(String filename) {
+        if (filename == null) {
+            return filename;
+        }
+        
+        String lowerFilename = filename.toLowerCase();
+        if (lowerFilename.endsWith(".webp")) {
+            return filename.substring(0, filename.length() - 5) + ".jpg";
+        }
+        
+        return filename;
     }
 
     private void deleteDirectory(Path directory) throws IOException {

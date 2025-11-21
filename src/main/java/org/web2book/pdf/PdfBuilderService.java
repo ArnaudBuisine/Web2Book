@@ -285,14 +285,14 @@ public class PdfBuilderService {
                         contentStream.setNonStrokingColor(0, 0, 0);
                         
                         // Draw each line of the title
-                        // First line uses larger font (36pt), subsequent lines use smaller font (28pt)
+                        // First line uses larger font (28pt), subsequent lines use smaller font (22pt)
                         for (int i = 0; i < titleLines.length; i++) {
                             String line = titleLines[i].trim();
                             if (line.isEmpty()) {
                                 continue; // Skip empty lines
                             }
                             
-                            float fontSize = (i == 0) ? 36f : 28f; // First line larger, rest smaller
+                            float fontSize = (i == 0) ? 28f : 22f; // First line larger, rest smaller
                             contentStream.beginText();
                             contentStream.setFont(titleFont, fontSize);
                             float lineWidth = titleFont.getStringWidth(line) / 1000f * fontSize;
@@ -579,16 +579,37 @@ public class PdfBuilderService {
     }
     
     /**
-     * Adds all images from a chapter to a single long page.
+     * Adds all images from a chapter to one or more pages.
      * Images are stacked vertically, each using full width (A4 width, no margins).
-     * Chapter title is added at the top of the page.
-     * The page height is calculated to fit all images plus title.
+     * Chapter title is added at the top of each page.
+     * The page height is calculated to fit images plus title.
+     * If max.images.per.chapter is set, images are split across multiple pages.
      * 
      * @param imageFiles List of image files to add
      * @param chapterTitle Title of the chapter to display at the top
      * @param failedFilenames Set of image filenames that failed to download (for placeholders)
      */
     private void addChapterImagesPage(List<Path> imageFiles, String chapterTitle, java.util.Set<String> failedFilenames) throws IOException {
+        // Get max images per page from properties (default: no limit if not specified)
+        // If max.images.per.chapter is not provided, all images go on a single page
+        int maxImagesPerPage = Integer.MAX_VALUE; // No limit by default
+        String maxImagesStr = bookProps.getProperty("max.images.per.chapter");
+        logger.info("Reading max.images.per.chapter property: " + maxImagesStr);
+        if (maxImagesStr != null && !maxImagesStr.trim().isEmpty()) {
+            try {
+                maxImagesPerPage = Integer.parseInt(maxImagesStr.trim());
+                logger.info("Parsed max.images.per.chapter = " + maxImagesPerPage);
+                if (maxImagesPerPage <= 0) {
+                    logger.warning("max.images.per.chapter is <= 0, using no limit");
+                    maxImagesPerPage = Integer.MAX_VALUE; // Invalid value, use no limit
+                }
+            } catch (NumberFormatException e) {
+                logger.warning("Invalid max.images.per.chapter value: " + maxImagesStr + ", using no limit");
+            }
+        } else {
+            logger.info("max.images.per.chapter not specified, using no limit (all images on one page)");
+        }
+        // If maxImagesPerPage is still Integer.MAX_VALUE, all images will be on one page
         // Ensure images are sorted by numeric filename (e.g., "1.jpg", "2.jpg", "10.jpg")
         // This prevents ordering issues when images are loaded from disk
         List<Path> sortedImageFiles = new java.util.ArrayList<>(imageFiles);
@@ -612,11 +633,11 @@ public class PdfBuilderService {
         float totalHeight = 0f;
         
         // Add space for chapter title at the top - reserve more space to ensure visibility
-        // Title spacing: 50f top margin + 24f font size + 20f bottom margin = 94f total
-        float titleTopMargin = 50f; // Space from top of page (increased for better spacing)
+        // Title spacing: 80f top margin + 24f font size + 30f bottom margin = 134f total
+        float titleTopMargin = 80f; // Space from top of page (increased for better visibility)
         float titleFontSize = 24f; // Font size for chapter title
-        float titleBottomMargin = 20f; // Space after title before images
-        float titleHeight = titleTopMargin + titleFontSize + titleBottomMargin; // Total: 94f
+        float titleBottomMargin = 30f; // Space after title before images
+        float titleHeight = titleTopMargin + titleFontSize + titleBottomMargin; // Total: 134f
         totalHeight += titleHeight;
         
         // Placeholder text height (approximate)
@@ -703,100 +724,153 @@ public class PdfBuilderService {
             return;
         }
         
-        // Create a custom page with A4 width and calculated height
-        PDRectangle customPageSize = new PDRectangle(PAGE_WIDTH, totalHeight);
-        PDPage page = new PDPage(customPageSize);
-        document.addPage(page);
+        // Split images into chunks based on maxImagesPerPage
+        int totalImages = imageItems.size();
         
-        // Second pass: draw chapter title and all images stacked vertically
-        try (PDPageContentStream contentStream = new PDPageContentStream(document, page)) {
-            float currentY = totalHeight; // Start from top of page
-            
-            // Draw chapter title at the top - reserve space and ensure it's visible
-            PDType1Font titleFont = getTitleFont();
-            
-            // Use same spacing values as calculated in first pass (already defined above)
-            
-            if (titleFont != null) {
-                try {
-                    // Set text color to black
-                    contentStream.setNonStrokingColor(0, 0, 0);
-                    contentStream.beginText();
-                    contentStream.setFont(titleFont, titleFontSize);
-                    // Center the title
-                    float titleWidth = titleFont.getStringWidth(chapterTitle) / 1000f * titleFontSize;
-                    float titleX = (PAGE_WIDTH - titleWidth) / 2f;
-                    // Position title with proper spacing from top
-                    // Y coordinate: totalHeight - titleTopMargin (20 points from top)
-                    currentY = totalHeight - titleTopMargin;
-                    contentStream.newLineAtOffset(titleX, currentY);
-                    contentStream.showText(chapterTitle);
-                    contentStream.endText();
-                    // Update currentY to leave space after title before first image
-                    currentY = totalHeight - titleTopMargin - titleFontSize - titleBottomMargin;
-                } catch (Exception e) {
-                    logger.severe("Failed to draw chapter title: " + e.getMessage());
-                    e.printStackTrace();
-                    // Even if title fails, reserve the space so images don't overlap
-                    currentY = totalHeight - titleTopMargin - titleFontSize - titleBottomMargin;
-                }
+        // Calculate page count - handle Integer.MAX_VALUE (no limit) case
+        int pageCount;
+        if (maxImagesPerPage == Integer.MAX_VALUE) {
+            // No limit - all images on one page
+            pageCount = 1;
+            logger.info("No limit set (maxImagesPerPage = Integer.MAX_VALUE), putting all " + totalImages + " images on 1 page");
+        } else {
+            // Limit set - calculate number of pages needed
+            pageCount = (int) Math.ceil((double) totalImages / maxImagesPerPage);
+            logger.info("Chapter " + chapterTitle + " has " + totalImages + " images, splitting into " + pageCount + " page(s) (max " + maxImagesPerPage + " per page)");
+        }
+        
+        // Process images in chunks
+        for (int pageIndex = 0; pageIndex < pageCount; pageIndex++) {
+            int startIndex = pageIndex * maxImagesPerPage;
+            int endIndex;
+            if (maxImagesPerPage == Integer.MAX_VALUE) {
+                // No limit - all images on this page
+                endIndex = totalImages;
             } else {
-                String errorMsg = "Cannot draw chapter title - font unavailable for: " + chapterTitle;
-                logger.severe(errorMsg);
-                System.err.println("WARNING: " + errorMsg);
-                // Reserve space even if font unavailable (prevents images from starting at top)
-                currentY = totalHeight - titleTopMargin - titleFontSize - titleBottomMargin;
+                endIndex = Math.min(startIndex + maxImagesPerPage, totalImages);
+            }
+            java.util.List<ImageItem> pageImageItems = imageItems.subList(startIndex, endIndex);
+            
+            // Calculate height for this page's images
+            // Only reserve title space on the first page of the chapter
+            float pageHeight = (pageIndex == 0) ? titleHeight : 0f; // Start with title height only on first page
+            for (ImageItem item : pageImageItems) {
+                if (item.isPlaceholder) {
+                    pageHeight += placeholderHeight;
+                } else {
+                    float imageWidth = item.image.getWidth();
+                    float imageHeight = item.image.getHeight();
+                    float scale = CONTENT_WIDTH / imageWidth;
+                    float scaledHeight = imageHeight * scale;
+                    pageHeight += scaledHeight;
+                }
             }
             
-            // Draw all images and placeholders stacked vertically
-            PDType1Font regularFont = getRegularFont();
-            for (ImageItem item : imageItems) {
-                if (item.isPlaceholder) {
-                    // Draw placeholder text
-                    if (regularFont != null) {
+            // Create page for this chunk
+            PDRectangle customPageSize = new PDRectangle(PAGE_WIDTH, pageHeight);
+            PDPage page = new PDPage(customPageSize);
+            document.addPage(page);
+            
+            // Build page title (full chapter title only on first page, add page numbers on subsequent pages)
+            String pageTitle = chapterTitle;
+            if (pageCount > 1 && pageIndex > 0) {
+                pageTitle = chapterTitle + " (Page " + (pageIndex + 1) + "/" + pageCount + ")";
+            }
+            
+            // Draw chapter title and images for this page
+            try (PDPageContentStream contentStream = new PDPageContentStream(document, page)) {
+                float currentY = pageHeight; // Start from top of page
+                
+                // Draw chapter title at the top (only on first page of chapter)
+                if (pageIndex == 0) {
+                    PDType1Font titleFont = getTitleFont();
+                    
+                    if (titleFont != null) {
                         try {
-                            contentStream.setNonStrokingColor(0.5f, 0.5f, 0.5f); // Gray color for placeholders
+                            contentStream.setNonStrokingColor(0, 0, 0);
                             contentStream.beginText();
-                            contentStream.setFont(regularFont, 12f);
-                            float textWidth = regularFont.getStringWidth(item.placeholderText) / 1000f * 12f;
-                            float textX = (PAGE_WIDTH - textWidth) / 2f;
-                            currentY -= placeholderHeight;
-                            contentStream.newLineAtOffset(textX, currentY);
-                            contentStream.showText(item.placeholderText);
+                            contentStream.setFont(titleFont, titleFontSize);
+                            float titleWidth = titleFont.getStringWidth(pageTitle) / 1000f * titleFontSize;
+                            float titleX = (PAGE_WIDTH - titleWidth) / 2f;
+                            // Position title: Y coordinate from bottom of page (PDF coordinate system)
+                            float titleY = pageHeight - titleTopMargin;
+                            contentStream.newLineAtOffset(titleX, titleY);
+                            contentStream.showText(pageTitle);
                             contentStream.endText();
-                            contentStream.setNonStrokingColor(0, 0, 0); // Reset to black
+                            // Set currentY to position where images should start (below title)
+                            currentY = pageHeight - titleTopMargin - titleFontSize - titleBottomMargin;
+                            logger.info("Chapter title drawn at start of chapter: " + pageTitle + " at Y=" + titleY);
                         } catch (Exception e) {
-                            logger.warning("Failed to draw placeholder text: " + e.getMessage());
+                            logger.severe("Failed to draw chapter title: " + e.getMessage());
+                            e.printStackTrace();
+                            currentY = pageHeight - titleTopMargin - titleFontSize - titleBottomMargin;
+                        }
+                    } else {
+                        String errorMsg = "Cannot draw chapter title - font unavailable for: " + pageTitle;
+                        logger.severe(errorMsg);
+                        // Still reserve space for title even if we can't draw it, so images start below where title would be
+                        currentY = pageHeight - titleTopMargin - titleFontSize - titleBottomMargin;
+                    }
+                }
+                // Note: For subsequent pages (pageIndex > 0), currentY starts at pageHeight (top of page)
+                // since no title space was reserved for those pages
+                
+                // Draw images and placeholders for this page
+                PDType1Font regularFont = getRegularFont();
+                for (ImageItem item : pageImageItems) {
+                    if (item.isPlaceholder) {
+                        // Draw placeholder text
+                        if (regularFont != null) {
+                            try {
+                                contentStream.setNonStrokingColor(0.5f, 0.5f, 0.5f);
+                                contentStream.beginText();
+                                contentStream.setFont(regularFont, 12f);
+                                float textWidth = regularFont.getStringWidth(item.placeholderText) / 1000f * 12f;
+                                float textX = (PAGE_WIDTH - textWidth) / 2f;
+                                currentY -= placeholderHeight;
+                                contentStream.newLineAtOffset(textX, currentY);
+                                contentStream.showText(item.placeholderText);
+                                contentStream.endText();
+                                contentStream.setNonStrokingColor(0, 0, 0);
+                            } catch (Exception e) {
+                                logger.warning("Failed to draw placeholder text: " + e.getMessage());
+                                currentY -= placeholderHeight;
+                            }
+                        } else {
                             currentY -= placeholderHeight;
                         }
                     } else {
-                        currentY -= placeholderHeight;
+                        // Draw actual image
+                        PDImageXObject pdImage = item.image;
+                        float imageWidth = pdImage.getWidth();
+                        float imageHeight = pdImage.getHeight();
+                        
+                        // Scale to full page width while maintaining aspect ratio
+                        float scale = CONTENT_WIDTH / imageWidth;
+                        float scaledWidth = CONTENT_WIDTH;
+                        float scaledHeight = imageHeight * scale;
+                        
+                        // Position image at current Y
+                        currentY -= scaledHeight;
+                        float x = MARGIN;
+                        float y = currentY;
+                        
+                        // Draw image at full width
+                        contentStream.drawImage(pdImage, x, y, scaledWidth, scaledHeight);
                     }
-                } else {
-                    // Draw actual image
-                    PDImageXObject pdImage = item.image;
-                    float imageWidth = pdImage.getWidth();
-                    float imageHeight = pdImage.getHeight();
-                    
-                    // Scale to full page width while maintaining aspect ratio
-                    float scale = CONTENT_WIDTH / imageWidth;
-                    float scaledWidth = CONTENT_WIDTH;
-                    float scaledHeight = imageHeight * scale;
-                    
-                    // Position image at current Y
-                    currentY -= scaledHeight;
-                    float x = MARGIN; // 0, but keeping for clarity
-                    float y = currentY;
-                    
-                    // Draw image at full width
-                    contentStream.drawImage(pdImage, x, y, scaledWidth, scaledHeight);
                 }
             }
+            
+            int pageImageCount = (int) pageImageItems.stream().filter(item -> !item.isPlaceholder).count();
+            int pagePlaceholderCount = (int) pageImageItems.stream().filter(item -> item.isPlaceholder).count();
+            logger.info("Added page " + (pageIndex + 1) + "/" + pageCount + " with " + pageImageCount + 
+                " images and " + pagePlaceholderCount + " placeholders (height: " + pageHeight + " points)");
         }
         
-        int imageCount = (int) imageItems.stream().filter(item -> !item.isPlaceholder).count();
-        int placeholderCount = (int) imageItems.stream().filter(item -> item.isPlaceholder).count();
-        logger.info("Added " + imageCount + " images and " + placeholderCount + " placeholders to chapter page with title (total height: " + totalHeight + " points)");
+        int totalImageCount = (int) imageItems.stream().filter(item -> !item.isPlaceholder).count();
+        int totalPlaceholderCount = (int) imageItems.stream().filter(item -> item.isPlaceholder).count();
+        logger.info("Chapter " + chapterTitle + " complete: " + totalImageCount + " images and " + 
+            totalPlaceholderCount + " placeholders across " + pageCount + " page(s)");
     }
 
     /**

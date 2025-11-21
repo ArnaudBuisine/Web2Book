@@ -28,9 +28,10 @@ public class LoggerFactory {
      * @param loggerName The name for the logger
      * @param outputDir The output directory where the log file should be created
      * @param bookTitle The book title (will be sanitized for filename)
+     * @param globalProps Global properties to read log level configuration
      * @return A Logger instance configured to write to a file
      */
-    public static Logger createFileLogger(String loggerName, Path outputDir, String bookTitle) {
+    public static Logger createFileLogger(String loggerName, Path outputDir, String bookTitle, java.util.Properties globalProps) {
         try {
             // Ensure output directory exists
             Files.createDirectories(outputDir);
@@ -42,15 +43,18 @@ public class LoggerFactory {
             String logFileName = sanitizedTitle + ".log";
             Path logFile = outputDir.resolve(logFileName);
             
+            // Get log level from properties (default: INFO)
+            Level logLevel = parseLogLevel(globalProps != null ? globalProps.getProperty("log.level", "INFO") : "INFO");
+            
             // Create logger
             Logger logger = Logger.getLogger(loggerName);
-            logger.setLevel(Level.FINEST); // Set to FINEST (equivalent to TRACE) for maximum detail
+            logger.setLevel(logLevel);
             logger.setUseParentHandlers(false); // Disable console output
             
             // Create file handler
             FileHandler fileHandler = new FileHandler(logFile.toString(), true);
             fileHandler.setFormatter(new SimpleFormatter());
-            fileHandler.setLevel(Level.FINEST); // Set to FINEST for maximum detail
+            fileHandler.setLevel(logLevel);
             
             logger.addHandler(fileHandler);
             
@@ -60,6 +64,26 @@ public class LoggerFactory {
             Logger logger = Logger.getLogger(loggerName);
             logger.log(Level.SEVERE, "Failed to create file logger: " + e.getMessage(), e);
             return logger;
+        }
+    }
+
+    /**
+     * Parses a log level string to a Level object.
+     * 
+     * @param levelStr The log level string (SEVERE, WARNING, INFO, FINE, FINER, FINEST, ALL, OFF)
+     * @return The corresponding Level object, or INFO if the string is invalid
+     */
+    private static Level parseLogLevel(String levelStr) {
+        if (levelStr == null || levelStr.trim().isEmpty()) {
+            return Level.INFO;
+        }
+        
+        String upperLevel = levelStr.trim().toUpperCase();
+        try {
+            return Level.parse(upperLevel);
+        } catch (IllegalArgumentException e) {
+            // Invalid level, return default
+            return Level.INFO;
         }
     }
 

@@ -3,7 +3,6 @@
 package org.web2book;
 
 import org.web2book.core.BookJob;
-import org.web2book.log.LoggerFactory;
 import org.web2book.net.HttpClientService;
 
 import java.io.FileInputStream;
@@ -32,35 +31,6 @@ public class Web2BookApp {
         // Try to disable font scanning completely
         System.setProperty("org.apache.pdfbox.disableFontCache", "true");
         
-        // Suppress PDFBox and FontBox font scanning warnings by setting log level
-        // This reduces noise in the output when font scanning encounters issues
-        // Set to OFF to completely suppress all messages, including SEVERE
-        
-        // Suppress all PDFBox logging
-        java.util.logging.Logger pdfboxLogger = java.util.logging.Logger.getLogger("org.apache.pdfbox");
-        pdfboxLogger.setLevel(java.util.logging.Level.OFF);
-        pdfboxLogger.setUseParentHandlers(false);
-        
-        // Suppress all FontBox logging
-        java.util.logging.Logger fontboxLogger = java.util.logging.Logger.getLogger("org.apache.fontbox");
-        fontboxLogger.setLevel(java.util.logging.Level.OFF);
-        fontboxLogger.setUseParentHandlers(false);
-        
-        // Specifically suppress GlyphSubstitutionTable warnings
-        java.util.logging.Logger glyphLogger = java.util.logging.Logger.getLogger("org.apache.fontbox.ttf.GlyphSubstitutionTable");
-        glyphLogger.setLevel(java.util.logging.Level.OFF);
-        glyphLogger.setUseParentHandlers(false);
-        
-        // Suppress all TTF-related warnings
-        java.util.logging.Logger ttfLogger = java.util.logging.Logger.getLogger("org.apache.fontbox.ttf");
-        ttfLogger.setLevel(java.util.logging.Level.OFF);
-        ttfLogger.setUseParentHandlers(false);
-        
-        // Suppress font provider warnings
-        java.util.logging.Logger fontProviderLogger = java.util.logging.Logger.getLogger("org.apache.pdfbox.pdmodel.font");
-        fontProviderLogger.setLevel(java.util.logging.Level.OFF);
-        fontProviderLogger.setUseParentHandlers(false);
-        
         System.out.println("=======================================");
         System.out.println("Web2Book - Web Manga to Book Converter");
         System.out.println("=======================================");
@@ -69,6 +39,9 @@ public class Web2BookApp {
         
         // Load global configuration
         Properties globalProps = loadGlobalConfig();
+        
+        // Configure PDFBox and FontBox log levels from properties
+        configurePdfBoxLogLevels(globalProps);
         if (globalProps == null) {
             System.err.println("ERROR: Failed to load " + GLOBAL_CONFIG_FILE);
             System.err.println("Please ensure " + GLOBAL_CONFIG_FILE + " exists in the current working directory.");
@@ -159,6 +132,65 @@ public class Web2BookApp {
         }
         
         return paths;
+    }
+
+    /**
+     * Configures PDFBox and FontBox log levels based on properties.
+     * 
+     * @param globalProps Global properties containing log level configuration
+     */
+    private static void configurePdfBoxLogLevels(Properties globalProps) {
+        // Get PDFBox log level from properties (default: WARNING)
+        String pdfboxLogLevelStr = globalProps != null 
+            ? globalProps.getProperty("pdfbox.log.level", "WARNING") 
+            : "WARNING";
+        
+        java.util.logging.Level pdfboxLogLevel = parseLogLevel(pdfboxLogLevelStr);
+        
+        // Set PDFBox logging level
+        java.util.logging.Logger pdfboxLogger = java.util.logging.Logger.getLogger("org.apache.pdfbox");
+        pdfboxLogger.setLevel(pdfboxLogLevel);
+        pdfboxLogger.setUseParentHandlers(false);
+        
+        // Set FontBox logging level
+        java.util.logging.Logger fontboxLogger = java.util.logging.Logger.getLogger("org.apache.fontbox");
+        fontboxLogger.setLevel(pdfboxLogLevel);
+        fontboxLogger.setUseParentHandlers(false);
+        
+        // Set GlyphSubstitutionTable logging level
+        java.util.logging.Logger glyphLogger = java.util.logging.Logger.getLogger("org.apache.fontbox.ttf.GlyphSubstitutionTable");
+        glyphLogger.setLevel(pdfboxLogLevel);
+        glyphLogger.setUseParentHandlers(false);
+        
+        // Set TTF-related logging level
+        java.util.logging.Logger ttfLogger = java.util.logging.Logger.getLogger("org.apache.fontbox.ttf");
+        ttfLogger.setLevel(pdfboxLogLevel);
+        ttfLogger.setUseParentHandlers(false);
+        
+        // Set font provider logging level
+        java.util.logging.Logger fontProviderLogger = java.util.logging.Logger.getLogger("org.apache.pdfbox.pdmodel.font");
+        fontProviderLogger.setLevel(pdfboxLogLevel);
+        fontProviderLogger.setUseParentHandlers(false);
+    }
+
+    /**
+     * Parses a log level string to a Level object.
+     * 
+     * @param levelStr The log level string (SEVERE, WARNING, INFO, FINE, FINER, FINEST, ALL, OFF)
+     * @return The corresponding Level object, or WARNING if the string is invalid
+     */
+    private static java.util.logging.Level parseLogLevel(String levelStr) {
+        if (levelStr == null || levelStr.trim().isEmpty()) {
+            return java.util.logging.Level.WARNING;
+        }
+        
+        String upperLevel = levelStr.trim().toUpperCase();
+        try {
+            return java.util.logging.Level.parse(upperLevel);
+        } catch (IllegalArgumentException e) {
+            // Invalid level, return default
+            return java.util.logging.Level.WARNING;
+        }
     }
 }
 
