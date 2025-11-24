@@ -4,7 +4,6 @@ A Java command-line application that converts web manga chapters into EPUB forma
 
 ## Quick Start
 
-mvn clean package & java -jar target/web2book-1.0.0.jar
 
 **Build the project:**
 ```bash
