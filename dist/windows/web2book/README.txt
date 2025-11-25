@@ -92,7 +92,7 @@ Before running the application, you may want to configure it:
    * max.chapters.per.book - Maximum chapters per volume/book
                           If set to 50, chapters 1-50, 51-100, etc. are split into separate files
                           If not set or 0, all chapters go into a single file
-   * max.images.per.chapter - Maximum images per PDF page (default: no limit)
+   * max.images.per.page - Maximum images per PDF page (default: no limit)
                             When reached, a new page is created for remaining images
                             Only applies to PDF format
    

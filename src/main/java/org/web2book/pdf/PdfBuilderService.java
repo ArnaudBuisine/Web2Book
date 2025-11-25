@@ -583,7 +583,7 @@ public class PdfBuilderService {
      * Images are stacked vertically, each using full width (A4 width, no margins).
      * Chapter title is added at the top of each page.
      * The page height is calculated to fit images plus title.
-     * If max.images.per.chapter is set, images are split across multiple pages.
+     * If max.images.per.page is set, images are split across multiple pages.
      * 
      * @param imageFiles List of image files to add
      * @param chapterTitle Title of the chapter to display at the top
@@ -591,23 +591,23 @@ public class PdfBuilderService {
      */
     private void addChapterImagesPage(List<Path> imageFiles, String chapterTitle, java.util.Set<String> failedFilenames) throws IOException {
         // Get max images per page from properties (default: no limit if not specified)
-        // If max.images.per.chapter is not provided, all images go on a single page
+        // If max.images.per.page is not provided, all images go on a single page
         int maxImagesPerPage = Integer.MAX_VALUE; // No limit by default
-        String maxImagesStr = bookProps.getProperty("max.images.per.chapter");
-        logger.info("Reading max.images.per.chapter property: " + maxImagesStr);
+        String maxImagesStr = bookProps.getProperty("max.images.per.page");
+        logger.info("Reading max.images.per.page property: " + maxImagesStr);
         if (maxImagesStr != null && !maxImagesStr.trim().isEmpty()) {
             try {
                 maxImagesPerPage = Integer.parseInt(maxImagesStr.trim());
-                logger.info("Parsed max.images.per.chapter = " + maxImagesPerPage);
+                logger.info("Parsed max.images.per.page = " + maxImagesPerPage);
                 if (maxImagesPerPage <= 0) {
-                    logger.warning("max.images.per.chapter is <= 0, using no limit");
+                    logger.warning("max.images.per.page is <= 0, using no limit");
                     maxImagesPerPage = Integer.MAX_VALUE; // Invalid value, use no limit
                 }
             } catch (NumberFormatException e) {
-                logger.warning("Invalid max.images.per.chapter value: " + maxImagesStr + ", using no limit");
+                logger.warning("Invalid max.images.per.page value: " + maxImagesStr + ", using no limit");
             }
         } else {
-            logger.info("max.images.per.chapter not specified, using no limit (all images on one page)");
+            logger.info("max.images.per.page not specified, using no limit (all images on one page)");
         }
         // If maxImagesPerPage is still Integer.MAX_VALUE, all images will be on one page
         // Ensure images are sorted by numeric filename (e.g., "1.jpg", "2.jpg", "10.jpg")
