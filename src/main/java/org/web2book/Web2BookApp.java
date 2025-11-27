@@ -34,7 +34,7 @@ public class Web2BookApp {
         System.out.println("=======================================");
         System.out.println("Web2Book - Web Manga to Book Converter");
         System.out.println("=======================================");
-        System.out.println("v1.2");
+        System.out.println("v2.!");
         System.out.println("=======================================");
         
         // Load global configuration
